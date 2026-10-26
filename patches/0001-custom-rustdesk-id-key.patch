@@ -1,0 +1,218 @@
+--- a/src/web/handlers/config/types.rs
++++ b/src/web/handlers/config/types.rs
+@@ -3,7 +3,6 @@
+ use crate::rtsp::RtspServiceStatus;
+ use crate::rustdesk::config::RustDeskConfig;
+ use crate::vnc::VncServiceStatus;
+-use base64::{engine::general_purpose::STANDARD, Engine as _};
+ use serde::{Deserialize, Serialize};
+ #[cfg(unix)]
+ use std::path::Path;
+@@ -891,27 +890,10 @@
+ }
+ 
+ /// hbbs/hbbr `-k` relay key: standard Base64 encoding of exactly 32 bytes (typically 44 chars with padding).
+-fn validate_rustdesk_relay_key(key: &str) -> Result<(), AppError> {
+-    let decoded = STANDARD.decode(key.as_bytes()).map_err(|_| {
+-        AppError::BadRequest(
+-            "Relay key must be standard Base64 (32 raw bytes, e.g. hbbs/hbbr -k output)".into(),
+-        )
+-    })?;
+-    if decoded.len() != 32 {
+-        return Err(AppError::BadRequest(
+-            format!(
+-                "Relay key must decode to exactly 32 bytes (got {} bytes after Base64 decode)",
+-                decoded.len()
+-            )
+-            .into(),
+-        ));
+-    }
+-    Ok(())
+-}
+-
+ #[typeshare]
+ #[derive(Debug, Deserialize)]
+ pub struct RustDeskConfigUpdate {
++    pub device_id: Option<String>,
+     pub enabled: Option<bool>,
+     pub mode: Option<crate::rustdesk::config::RustDeskMode>,
+     pub codec: Option<crate::rustdesk::config::RustDeskCodec>,
+@@ -953,12 +935,6 @@
+                 return Err(AppError::BadRequest(
+                     "Device password must be at least 6 characters".into(),
+                 ));
+-            }
+-        }
+-        if let Some(ref key) = self.relay_key {
+-            let trimmed = key.trim();
+-            if !trimmed.is_empty() {
+-                validate_rustdesk_relay_key(trimmed)?;
+             }
+         }
+         Ok(())
+@@ -1010,13 +986,13 @@
+                 Some(server.clone())
+             };
+         }
++        if let Some(ref id) = self.device_id {
++            config.device_id = id.clone();
++        }
++        // Relay authentication is an opaque shared string, not an Ed25519 public key.
++        // Empty explicitly clears it; an omitted field keeps the current value.
+         if let Some(ref key) = self.relay_key {
+-            let trimmed = key.trim();
+-            config.relay_key = if trimmed.is_empty() {
+-                None
+-            } else {
+-                Some(trimmed.to_string())
+-            };
++            config.relay_key = if key.is_empty() { None } else { Some(key.clone()) };
+         }
+         if let Some(ref password) = self.device_password {
+             if !password.is_empty() {
+--- a/web/src/api/config.ts
++++ b/web/src/api/config.ts
+@@ -242,6 +242,7 @@
+ }
+ 
+ export interface RustDeskConfigUpdate {
++  device_id?: string
+   enabled?: boolean
+   mode?: 'id' | 'direct_ip'
+   codec?: 'h264' | 'h265'
+--- a/web/src/types/generated.ts
++++ b/web/src/types/generated.ts
+@@ -659,6 +659,7 @@
+ }
+ 
+ export interface RustDeskConfigUpdate {
++	device_id?: string;
+ 	enabled?: boolean;
+ 	mode?: RustDeskMode;
+ 	codec?: RustDeskCodec;
+--- a/web/src/views/SettingsView.vue
++++ b/web/src/views/SettingsView.vue
+@@ -511,6 +511,7 @@
+ const rustdeskCopied = ref<'id' | 'password' | null>(null)
+ const { copy: clipboardCopy } = useClipboard()
+ const rustdeskLocalConfig = ref({
++  device_id: '',
+   enabled: false,
+   mode: 'id' as 'id' | 'direct_ip',
+   codec: 'h264' as 'h264' | 'h265',
+@@ -1978,6 +1979,7 @@
+   rustdeskConfig.value = config
+   rustdeskStatus.value = status
+   rustdeskLocalConfig.value = {
++    device_id: config.device_id,
+     enabled: config.enabled,
+     mode: config.mode || 'id',
+     codec: config.codec || 'h264',
+@@ -2011,12 +2013,6 @@
+   if (!trimmed) return ''
+   if (trimmed.includes(':')) return trimmed
+   return `${trimmed}:${defaultPort}`
+-}
+-
+-/** Strip line breaks from pasted keys. */
+-function normalizeRustdeskRelayKey(value: string): string {
+-  const cleaned = value.replace(/\r?\n/g, '').trim()
+-  return cleaned
+ }
+ 
+ function showValidationError(message: string): boolean {
+@@ -2374,6 +2370,7 @@
+ 
+ function rustdeskUpdatePayload(enabled = rustdeskLocalConfig.value.enabled) {
+   return {
++    device_id: rustdeskLocalConfig.value.device_id,
+     enabled,
+     mode: rustdeskLocalConfig.value.mode,
+     codec: rustdeskLocalConfig.value.codec,
+@@ -2383,7 +2380,7 @@
+       21116,
+     ),
+     relay_server: normalizeRustdeskServer(rustdeskLocalConfig.value.relay_server, 21117),
+-    relay_key: normalizeRustdeskRelayKey(rustdeskLocalConfig.value.relay_key),
++    relay_key: rustdeskLocalConfig.value.relay_key,
+   }
+ }
+ 
+@@ -5118,14 +5115,15 @@
+                     <Label class="sm:text-right">{{ t('extensions.rustdesk.relayKey') }}</Label>
+                     <div class="sm:col-span-3 space-y-1">
+                       <div class="relative">
+-                        <Input
++                        <Textarea
+                           v-model="rustdeskLocalConfig.relay_key"
+-                          :type="showPasswords ? 'text' : 'password'"
+-                          :disabled="!rustdeskLocalConfig.rendezvous_server || rustdeskStatus?.service_status === 'running'"
+-                          maxlength="44"
++                          :style="showPasswords ? {} : { '-webkit-text-security': 'disc' }"
++                          :disabled="rustdeskLoading"
++                          :aria-label="t('extensions.rustdesk.relayKey')"
++                          :rows="2"
+                           autocomplete="off"
+                           spellcheck="false"
+-                          class="font-mono"
++                          class="font-mono pr-10"
+                         />
+                         <Button
+                           type="button"
+@@ -5163,7 +5161,18 @@
+                   <div v-if="rustdeskLocalConfig.mode === 'id'" class="grid gap-2 sm:grid-cols-4 sm:items-center">
+                     <Label class="sm:text-right">{{ t('extensions.rustdesk.deviceId') }}</Label>
+                     <div class="sm:col-span-3 flex items-center gap-2">
+-                      <code class="font-mono text-lg bg-muted px-3 py-1 rounded">{{ rustdeskConfig?.device_id || '-' }}</code>
++                      <div class="min-w-0 flex-1 space-y-1">
++                        <Textarea
++                          v-model="rustdeskLocalConfig.device_id"
++                          :disabled="rustdeskLoading"
++                          :aria-label="t('extensions.rustdesk.deviceId')"
++                          :rows="1"
++                          autocomplete="off"
++                          spellcheck="false"
++                          class="font-mono"
++                        />
++                        <p class="text-xs text-muted-foreground">{{ t('extensions.rustdesk.customIdHint') }}</p>
++                      </div>
+                       <Button
+                         variant="ghost"
+                         size="icon"
+--- a/web/src/i18n/zh-CN.ts
++++ b/web/src/i18n/zh-CN.ts
+@@ -1199,6 +1199,7 @@
+       relayServerPlaceholder: 'hbbr.example.com:21117',
+       relayKey: '中继密钥',
+       codec: '编码格式',
++      customIdHint: 'ID 和中继 Key 按原值保存，不做格式校验；服务器注册结果单独显示。',
+       deviceId: '设备 ID',
+       devicePassword: '设备密码',
+       showPassword: '显示密码',
+--- a/web/src/i18n/en-US.ts
++++ b/web/src/i18n/en-US.ts
+@@ -1200,6 +1200,7 @@
+       relayServerPlaceholder: 'hbbr.example.com:21117',
+       relayKey: 'Relay Key',
+       codec: 'Codec',
++      customIdHint: 'ID and relay Key are saved verbatim without format validation. Server registration status is shown separately.',
+       deviceId: 'Device ID',
+       devicePassword: 'Device Password',
+       showPassword: 'Show Password',
+--- a/src/rustdesk/rendezvous.rs
++++ b/src/rustdesk/rendezvous.rs
+@@ -497,7 +497,14 @@
+                         error!("Invalid device ID format");
+                         self.set_status(RendezvousStatus::Error("Invalid ID format".to_string()));
+                     }
++                    6 => {
++                        self.set_status(RendezvousStatus::Error("Server does not support this registration".to_string()));
++                    }
++                    7 => {
++                        self.set_status(RendezvousStatus::Error("ID server error".to_string()));
++                    }
+                     _ => {
++                        self.set_status(RendezvousStatus::Error(format!("Unknown registration result: {:?}", rpr.result)));
+                         error!("Unknown RegisterPkResponse result: {:?}", rpr.result);
+                     }
+                 }

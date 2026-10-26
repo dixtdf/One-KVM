@@ -1,0 +1,9 @@
+{
+  "upstream": "b5d13ee16e099df4082e1da96a37db0888c57bb7",
+  "rust": "1.99.1",
+  "debian": "debian:12@sha256:854dd8ab51d62866dbd8f5431d15ce77b12983a2a4a1e1fe43a2395dc7ef9f61",
+  "x264": "c24e06c2e184345ceb33eb20a15d1024d9fd3497",
+  "mpp": "a9380ef333102ac318628f83b5f7a460d377749e",
+  "rga": "1d330cc28551943bed3380261a5a9c6fbd58ff53",
+  "version": "0.2.8+custom.1"
+}
