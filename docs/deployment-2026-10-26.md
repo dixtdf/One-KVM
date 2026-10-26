@@ -98,3 +98,23 @@ Private backup and rollback remain on the Pi at
 custom.1 and the immediate pre-upgrade database and remove the frontend override.
 The new override drop-in is `30-manual-id-frontend.conf`; the existing C792 bridge
 drop-ins remain in place. Configuration databases and keys are not included here.
+
+
+## Manual password editor
+
+Frontend commit f93da764c0810a097cf245b50249024ee3894929, Actions run
+40321247422, adds a masked custom password input and removes random password
+generation from the UI. A blank draft omits device_password and preserves the
+current password. Saving a nonempty draft uses the existing custom.2 API; its
+minimum six-byte check remains. The draft is cleared only after successful save.
+Artifact ZIP SHA-256: 0a266e4e018308a4f77d38b077818ab18d0991862fa98d2f5ec9c410b937f858.
+The deployed frontend override is frontend-manual-password-f93da76.
+
+An isolated copy of the device database, with hardware/network features disabled,
+passed real ARM64 API checks for password updates, process restart persistence,
+omitted-field preservation, and rejection of a short password without changing
+the old value. Production configuration compared equal before and after the
+frontend deployment, and served HTML matched the verified artifact. No production
+password was changed. The service and C792 bridge are active; the USB gadget was
+reattached live on Unraid following service restart. Private backup, including the
+previous frontend drop-in, is /root/one-kvm-password-ui-20261026/ on the device.
