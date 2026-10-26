@@ -1,15 +1,35 @@
 --- a/web/src/views/SettingsView.vue
 +++ b/web/src/views/SettingsView.vue
-@@ -4564,9 +4564,9 @@
+@@ -1808,12 +1808,6 @@
+   extConfig.value.easytier.peer_urls.push('')
+ }
+ 
+-function removeEasytierPeer(index: number) {
+-  if (extConfig.value.easytier.peer_urls) {
+-    extConfig.value.easytier.peer_urls.splice(index, 1)
+-  }
+-}
+-
+ async function loadAtxConfig() {
+   try {
+     const config = await configStore.refreshAtx()
+@@ -4564,12 +4558,13 @@
                          <div class="grid gap-2 sm:grid-cols-4 sm:items-center">
                            <Label class="sm:text-right">{{ t('extensions.easytier.peers') }}</Label>
                            <div class="sm:col-span-3 space-y-2">
 -                            <div v-for="(_, i) in extConfig.easytier.peer_urls" :key="i" class="flex gap-2">
 -                              <Input v-model="extConfig.easytier.peer_urls[i]" placeholder="tcp://1.2.3.4:11010" :disabled="isExtRunning(extensions?.easytier?.status)" />
 -                              <Button variant="ghost" size="icon" :aria-label="t('common.delete')" @click="removeEasytierPeer(i)" :disabled="isExtRunning(extensions?.easytier?.status)">
-+                            <div v-for="peerIndex in extConfig.easytier.peer_urls.length" :key="peerIndex" class="flex gap-2">
-+                              <Input v-model="extConfig.easytier.peer_urls[peerIndex - 1]" placeholder="tcp://1.2.3.4:11010" :disabled="isExtRunning(extensions?.easytier?.status)" />
-+                              <Button variant="ghost" size="icon" :aria-label="t('common.delete')" @click="removeEasytierPeer(peerIndex - 1)" :disabled="isExtRunning(extensions?.easytier?.status)">
-                                 <Trash2 class="size-4" />
-                               </Button>
-                             </div>
+-                                <Trash2 class="size-4" />
+-                              </Button>
+-                            </div>
++                            <Textarea
++                              :model-value="extConfig.easytier.peer_urls.join('\n')"
++                              @update:model-value="value => extConfig.easytier.peer_urls = String(value).split('\n')"
++                              placeholder="tcp://1.2.3.4:11010"
++                              :disabled="isExtRunning(extensions?.easytier?.status)"
++                              :rows="3"
++                            />
+                             <Button variant="outline" size="sm" @click="addEasytierPeer" :disabled="isExtRunning(extensions?.easytier?.status)">
+                               <Plus class="size-4 mr-1" />
+                               {{ t('extensions.easytier.addPeer') }}
