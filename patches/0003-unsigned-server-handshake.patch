@@ -1,0 +1,90 @@
+--- a/src/rustdesk/connection.rs
++++ b/src/rustdesk/connection.rs
+@@ -197,6 +197,7 @@
+     session_key: Option<secretbox::Key>,
+     /// Encryption enabled flag
+     encryption_enabled: bool,
++    password_challenge_sent: bool,
+     /// Decryption sequence number (for nonce generation)
+     dec_seqnum: u64,
+     /// Negotiated video codec (after client capability exchange)
+@@ -286,6 +287,7 @@
+             audio_task: None,
+             session_key: None,
+             encryption_enabled: false,
++            password_challenge_sent: false,
+             dec_seqnum: 0,
+             negotiated_codec: None,
+             input_throttler: InputThrottler::new(),
+@@ -365,6 +367,7 @@
+                     .map_err(|e| anyhow::anyhow!("Failed to encode Hash: {}", e))?;
+                 debug!("Sending password challenge for direct IP connection");
+                 self.send_framed(&control_tx, &hash_bytes).await?;
++                self.password_challenge_sent = true;
+             }
+         }
+ 
+@@ -629,7 +632,21 @@
+                 info!("Received unhandled message type: {}", type_name);
+             }
+             None => {
+-                debug!("Received empty message");
++                // Official clients send an empty Message when hbbs cannot provide
++                // a verified signing key (for example a custom-string -k server).
++                // This only starts password authentication; it never authenticates
++                // a peer or downgrades an already negotiated encrypted session.
++                if self.mode == ConnectionMode::Secure
++                    && self.state() == ConnectionState::Handshaking
++                    && !self.password_challenge_sent
++                    && self.session_key.is_none()
++                    && !self.encryption_enabled
++                {
++                    info!("Client selected unsigned-server handshake; sending password challenge");
++                    self.handle_peer_public_key(&PublicKey::new(), writer).await?;
++                } else {
++                    debug!("Ignoring empty message outside initial key exchange");
++                }
+             }
+         }
+ 
+@@ -995,6 +1012,7 @@
+             self.encryption_enabled
+         );
+         self.send_encrypted(writer, &hash_bytes).await?;
++        self.password_challenge_sent = true;
+ 
+         Ok(())
+     }
+--- a/src/rustdesk/mod.rs
++++ b/src/rustdesk/mod.rs
+@@ -628,7 +628,7 @@
+     local_addr: SocketAddr,
+     relay_server: &str,
+     device_id: &str,
+-    connection_manager: Arc<ConnectionManager>,
++    _connection_manager: Arc<ConnectionManager>,
+ ) -> anyhow::Result<()> {
+     info!(
+         "Handling intranet request: rendezvous={}, local_addr={}, device_id={}",
+@@ -662,18 +662,8 @@
+ 
+     bytes_codec::write_frame(&mut stream, &bytes).await?;
+ 
+-    info!("Sent LocalAddr to rendezvous server, waiting for peer connection");
+-
+-    let effective_peer_addr = peer_addr.unwrap_or_else(|| {
+-        rendezvous_addr
+-            .parse()
+-            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+-    });
+-
+-    connection_manager
+-        .accept_connection(stream, effective_peer_addr)
+-        .await?;
+-    info!("Intranet connection established via rendezvous server proxy");
+-
++    // hbbs forwards LocalAddr and closes this control connection. Peer
++    // traffic arrives on the separately bound local TCP listener, not here.
++    info!("Advertised intranet listener to rendezvous server");
+     Ok(())
+ }

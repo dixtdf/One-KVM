@@ -30,3 +30,10 @@ Corresponding source and complete modifications accompany every artifact.
 
 The ARM64 custom.1 build was installed and checked on 2026-10-26. See
 [deployment evidence and limits](docs/deployment-2026-10-26.md).
+
+## Unsigned ID-server handshake compatibility
+
+custom.2 handles the official client empty-Message key-exchange fallback by
+sending the normal password challenge once. It preserves password verification
+and never switches an established encrypted session to plaintext. A LocalAddr
+control connection to hbbs is no longer treated as a remote-desktop data stream.

@@ -32,6 +32,6 @@ s=s.replace(anchor,'    mkdir -p "$PKG_DIR/usr/share/doc/one-kvm"\n    cp "$PROJ
 p.write_text(s,newline="\n")
 shutil.copyfile(root/"locks/frontend-package-lock.json",src/"web/package-lock.json")
 out=root/"out";out.mkdir(exist_ok=True)
-(out/"provenance.json").write_text(json.dumps({"upstream_commit":head,"pins":pins,"patch_sha256":hashlib.sha256(patch.read_bytes()).hexdigest()},indent=2))
+(out/"provenance.json").write_text(json.dumps({"upstream_commit":head,"pins":pins,"patch_sha256":hashlib.sha256(patch.read_bytes()).hexdigest(),"patches":{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted((root/"patches").glob("*.patch"))}},indent=2))
 (out/"source-changes.patch").write_bytes(subprocess.check_output(["git","diff","--binary"],cwd=src))
 print("Pinned source and custom patch prepared")
