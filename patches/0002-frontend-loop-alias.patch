@@ -7,9 +7,9 @@
 -                            <div v-for="(_, i) in extConfig.easytier.peer_urls" :key="i" class="flex gap-2">
 -                              <Input v-model="extConfig.easytier.peer_urls[i]" placeholder="tcp://1.2.3.4:11010" :disabled="isExtRunning(extensions?.easytier?.status)" />
 -                              <Button variant="ghost" size="icon" :aria-label="t('common.delete')" @click="removeEasytierPeer(i)" :disabled="isExtRunning(extensions?.easytier?.status)">
-+                            <div v-for="(peerUrl, peerIndex) in extConfig.easytier.peer_urls" :key="peerIndex" class="flex gap-2">
-+                              <Input v-model="extConfig.easytier.peer_urls[peerIndex]" placeholder="tcp://1.2.3.4:11010" :disabled="isExtRunning(extensions?.easytier?.status)" />
-+                              <Button variant="ghost" size="icon" :aria-label="t('common.delete')" @click="removeEasytierPeer(peerIndex)" :disabled="isExtRunning(extensions?.easytier?.status)">
++                            <div v-for="peerIndex in extConfig.easytier.peer_urls.length" :key="peerIndex" class="flex gap-2">
++                              <Input v-model="extConfig.easytier.peer_urls[peerIndex - 1]" placeholder="tcp://1.2.3.4:11010" :disabled="isExtRunning(extensions?.easytier?.status)" />
++                              <Button variant="ghost" size="icon" :aria-label="t('common.delete')" @click="removeEasytierPeer(peerIndex - 1)" :disabled="isExtRunning(extensions?.easytier?.status)">
                                  <Trash2 class="size-4" />
                                </Button>
                              </div>
