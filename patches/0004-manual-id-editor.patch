@@ -1,0 +1,73 @@
+--- a/web/src/views/SettingsView.vue
++++ b/web/src/views/SettingsView.vue
+@@ -2403,19 +2403,6 @@
+   }
+ }
+ 
+-async function regenerateRustdeskId() {
+-  if (!confirm(t('extensions.rustdesk.confirmRegenerateId'))) return
+-  rustdeskLoading.value = true
+-  try {
+-    await configStore.regenerateRustdeskId()
+-    await loadRustdeskConfig()
+-    await loadRustdeskPassword()
+-  } catch {
+-  } finally {
+-    rustdeskLoading.value = false
+-  }
+-}
+-
+ async function regenerateRustdeskPassword() {
+   if (!confirm(t('extensions.rustdesk.confirmRegeneratePassword'))) return
+   rustdeskLoading.value = true
+@@ -5159,13 +5146,14 @@
+                 <div class="space-y-3">
+                   <!-- Device ID -->
+                   <div v-if="rustdeskLocalConfig.mode === 'id'" class="grid gap-2 sm:grid-cols-4 sm:items-center">
+-                    <Label class="sm:text-right">{{ t('extensions.rustdesk.deviceId') }}</Label>
++                    <Label class="sm:text-right">{{ t('extensions.rustdesk.customIdLabel') }}</Label>
+                     <div class="sm:col-span-3 flex items-center gap-2">
+                       <div class="min-w-0 flex-1 space-y-1">
+                         <Textarea
+                           v-model="rustdeskLocalConfig.device_id"
+                           :disabled="rustdeskLoading"
+-                          :aria-label="t('extensions.rustdesk.deviceId')"
++                          :aria-label="t('extensions.rustdesk.customIdLabel')"
++                          :placeholder="t('extensions.rustdesk.customIdPlaceholder')"
+                           :rows="1"
+                           autocomplete="off"
+                           spellcheck="false"
+@@ -5184,10 +5172,7 @@
+                         <Check v-if="rustdeskCopied === 'id'" class="size-4 text-success" />
+                         <Copy v-else class="size-4" />
+                       </Button>
+-                      <Button variant="outline" size="sm" @click="regenerateRustdeskId" :disabled="rustdeskLoading">
+-                        <RefreshCw class="size-4 mr-1" />
+-                        {{ t('extensions.rustdesk.regenerateId') }}
+-                      </Button>
++
+                     </div>
+                   </div>
+ 
+--- a/web/src/i18n/zh-CN.ts
++++ b/web/src/i18n/zh-CN.ts
+@@ -1199,6 +1199,8 @@
+       relayServerPlaceholder: 'hbbr.example.com:21117',
+       relayKey: '中继密钥',
+       codec: '编码格式',
++      customIdLabel: '手动输入自定义 ID',
++      customIdPlaceholder: '在此输入固定 ID，点击上方“保存”应用',
+       customIdHint: 'ID 和中继 Key 按原值保存，不做格式校验；服务器注册结果单独显示。',
+       deviceId: '设备 ID',
+       devicePassword: '设备密码',
+--- a/web/src/i18n/en-US.ts
++++ b/web/src/i18n/en-US.ts
+@@ -1200,6 +1200,8 @@
+       relayServerPlaceholder: 'hbbr.example.com:21117',
+       relayKey: 'Relay Key',
+       codec: 'Codec',
++      customIdLabel: 'Enter custom ID manually',
++      customIdPlaceholder: 'Type your fixed ID, then click Save above',
+       customIdHint: 'ID and relay Key are saved verbatim without format validation. Server registration status is shown separately.',
+       deviceId: 'Device ID',
+       devicePassword: 'Device Password',

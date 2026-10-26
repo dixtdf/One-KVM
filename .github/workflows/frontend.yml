@@ -1,0 +1,40 @@
+name: Build manual ID frontend
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          path: custom
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: mofeng-git/One-KVM
+          ref: b5d13ee16e099df4082e1da96a37db0888c57bb7
+          path: source
+          persist-credentials: false
+      - run: python3 custom/scripts/prepare.py source
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24.11.0"
+      - name: Type check and build manual ID frontend
+        working-directory: source/web
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+      - name: Package native frontend override
+        run: |
+          tar -C source/web/dist -czf custom/out/manual-id-frontend.tar.gz .
+          cp custom/patches/*.patch custom/out/
+          cp source/web/package-lock.json custom/out/frontend-package-lock.json
+          cd custom/out
+          sha256sum *.tar.gz *.patch > SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: manual-id-frontend
+          path: custom/out/
+          retention-days: 30
