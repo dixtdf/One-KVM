@@ -25,3 +25,8 @@ USB reattachment on Unraid. Verify actual video pixels and HID.
 ## License
 AGPL-3.0-only. Preserve upstream copyright and dependency notices.
 Corresponding source and complete modifications accompany every artifact.
+
+## Verified deployment
+
+The ARM64 custom.1 build was installed and checked on 2026-10-26. See
+[deployment evidence and limits](docs/deployment-2026-10-26.md).
