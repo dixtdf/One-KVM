@@ -1,4 +1,4 @@
-import pathlib,json,subprocess,sys,hashlib
+import pathlib,json,subprocess,sys,hashlib,shutil
 root=pathlib.Path(__file__).resolve().parents[1]
 src=pathlib.Path(sys.argv[1]).resolve()
 pins=json.loads((root/"pins.json").read_text())
@@ -30,6 +30,7 @@ p=src/"build/build-images.sh";s=p.read_text().replace("cross build --release --t
 p=src/"build/package-deb.sh";s=p.read_text();anchor="    # Build deb directly on host"
 s=s.replace(anchor,'    mkdir -p "$PKG_DIR/usr/share/doc/one-kvm"\n    cp "$PROJECT_DIR/LICENSE" "$PKG_DIR/usr/share/doc/one-kvm/copyright"\n    cp -r "$PROJECT_DIR/licenses" "$PKG_DIR/usr/share/doc/one-kvm/licenses"\n    cp "'+str(root/'README.md')+'" "$PKG_DIR/usr/share/doc/one-kvm/CUSTOM-BUILD.md"\n'+anchor)
 p.write_text(s,newline="\n")
+shutil.copyfile(root/"locks/frontend-package-lock.json",src/"web/package-lock.json")
 out=root/"out";out.mkdir(exist_ok=True)
 (out/"provenance.json").write_text(json.dumps({"upstream_commit":head,"pins":pins,"patch_sha256":hashlib.sha256(patch.read_bytes()).hexdigest()},indent=2))
 (out/"source-changes.patch").write_bytes(subprocess.check_output(["git","diff","--binary"],cwd=src))

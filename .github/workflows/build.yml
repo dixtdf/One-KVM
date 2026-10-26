@@ -35,7 +35,6 @@ jobs:
       - name: Build frontend with type checks
         working-directory: source/web
         run: |
-          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
           npm ci --no-audit --no-fund
           npm run build
       - name: Install pinned Rust toolchain

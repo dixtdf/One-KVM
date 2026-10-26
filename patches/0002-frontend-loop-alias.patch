@@ -1,6 +1,6 @@
 --- a/web/src/views/SettingsView.vue
 +++ b/web/src/views/SettingsView.vue
-@@ -1808,12 +1808,6 @@
+@@ -1808,10 +1808,8 @@
    extConfig.value.easytier.peer_urls.push('')
  }
  
@@ -8,12 +8,12 @@
 -  if (extConfig.value.easytier.peer_urls) {
 -    extConfig.value.easytier.peer_urls.splice(index, 1)
 -  }
--}
--
++function updateEasytierPeers(value: string | number) {
++  extConfig.value.easytier.peer_urls = String(value).split('\n')
+ }
+ 
  async function loadAtxConfig() {
-   try {
-     const config = await configStore.refreshAtx()
-@@ -4564,12 +4558,13 @@
+@@ -4564,12 +4562,13 @@
                          <div class="grid gap-2 sm:grid-cols-4 sm:items-center">
                            <Label class="sm:text-right">{{ t('extensions.easytier.peers') }}</Label>
                            <div class="sm:col-span-3 space-y-2">
@@ -25,7 +25,7 @@
 -                            </div>
 +                            <Textarea
 +                              :model-value="extConfig.easytier.peer_urls.join('\n')"
-+                              @update:model-value="value => extConfig.easytier.peer_urls = String(value).split('\n')"
++                              @update:model-value="updateEasytierPeers"
 +                              placeholder="tcp://1.2.3.4:11010"
 +                              :disabled="isExtRunning(extensions?.easytier?.status)"
 +                              :rows="3"
