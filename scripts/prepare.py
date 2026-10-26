@@ -9,8 +9,9 @@ def change(path,old,new):
 head=subprocess.check_output(["git","rev-parse","HEAD"],cwd=src,text=True).strip()
 assert head==pins["upstream"],head
 patch=root/"patches/0001-custom-rustdesk-id-key.patch"
-subprocess.run(["git","apply","--check",str(patch)],cwd=src,check=True)
-subprocess.run(["git","apply",str(patch)],cwd=src,check=True)
+for item in sorted((root/"patches").glob("*.patch")):
+ subprocess.run(["git","apply","--check",str(item)],cwd=src,check=True)
+ subprocess.run(["git","apply",str(item)],cwd=src,check=True)
 change("Cargo.toml",'version = "0.2.8"','version = "'+pins["version"]+'"')
 change("Cargo.lock",'name = "one-kvm"\nversion = "0.2.8"','name = "one-kvm"\nversion = "'+pins["version"]+'"')
 p=src/"build/cross/Dockerfile.arm64";s=p.read_text()
