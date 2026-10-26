@@ -35,7 +35,8 @@ jobs:
       - name: Build frontend with type checks
         working-directory: source/web
         run: |
-          npm ci
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+          npm ci --no-audit --no-fund
           npm run build
       - name: Install pinned Rust toolchain
         run: |
@@ -57,6 +58,7 @@ jobs:
           git -C source archive --format=tar --prefix=one-kvm/ HEAD | gzip > custom/out/upstream-source.tar.gz
           cp custom/patches/*.patch custom/out/
           cp custom/pins.json custom/out/
+          cp source/web/package-lock.json custom/out/frontend-package-lock.json
           cp source/LICENSE custom/out/LICENSE
           cp custom/README.md custom/out/README.md
           cd custom/out
