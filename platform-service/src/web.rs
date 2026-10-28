@@ -17,11 +17,18 @@ pub struct Service {
     login_failures: Mutex<BTreeMap<String, (i64, usize)>>,
     hashing_slots: Semaphore,
     dummy_hash: String,
+    inventory: crate::discovery::Inventory,
 }
 
 impl Service {
     pub fn new(pool: SqlitePool) -> Arc<Self> {
+        Self::with_inventory(pool, crate::discovery::Inventory::System {
+            sys: "/sys".into(), dev: "/dev".into(),
+        })
+    }
+    pub fn with_inventory(pool: SqlitePool, inventory: crate::discovery::Inventory) -> Arc<Self> {
         Arc::new(Self { pool, mutation: Mutex::new(()), login_failures: Mutex::new(BTreeMap::new()),
+            inventory,
             hashing_slots: Semaphore::new(4),
             dummy_hash: store::password_hash(&Uuid::new_v4().to_string()).expect("Hash initialization failed") })
     }
@@ -46,6 +53,8 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/users", get(users).post(create_user))
         .route("/users/{id}", put(update_user))
         .route("/resources", get(resources).post(create_resource))
+        .route("/discovery", get(discovery))
+        .route("/resources/register", post(register_resource))
         .route("/resources/{id}", delete(delete_resource))
         .route("/channels", get(channels).post(create_channel))
         .route("/channels/{id}", put(update_channel).delete(delete_channel))
@@ -149,10 +158,28 @@ async fn update_user(State(s): State<Arc<Service>>, Extension(p): Extension<Prin
 async fn resources(State(s): State<Arc<Service>>, Extension(p): Extension<Principal>) -> Result<Json<Vec<Resource>>> {
     admin(&p)?; Ok(Json(store::resources(&s.pool).await.map_err(|_| bad("Invalid resource data"))?))
 }
+async fn discovery(State(s): State<Arc<Service>>, Extension(p): Extension<Principal>) -> Result<Json<Vec<crate::discovery::Candidate>>> {
+    admin(&p)?;
+    Ok(Json(s.inventory.read()))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterResource { candidate_id: String, name: String }
+async fn register_resource(State(s): State<Arc<Service>>, Extension(p): Extension<Principal>, Json(req): Json<RegisterResource>) -> Result<Json<Resource>> {
+    admin(&p)?;
+    let inventory=s.inventory.read();
+    let candidates: Vec<_>=inventory.iter().filter(|c|c.id==req.candidate_id).collect();
+    if candidates.len()!=1 {return Err(bad("Device is missing or ambiguous"));}
+    let resource=candidates[0].resource(req.name,Uuid::new_v4().to_string());
+    create_resource(State(s),Extension(p),Json(resource)).await
+}
 async fn create_resource(State(s): State<Arc<Service>>, Extension(p): Extension<Principal>, Json(mut resource): Json<Resource>) -> Result<Json<Resource>> {
     admin(&p)?; resource.id = Uuid::new_v4().to_string();
     resource.domain().map_err(bad)?;
-    // This is metadata only: selectors cannot yet cause filesystem or device access.
+    let inventory=s.inventory.read();
+    let matched:Vec<_>=inventory.iter().filter(|c|c.kind==resource.kind
+        && c.selector_kind==resource.selector_kind && c.selector==resource.selector).collect();
+    if matched.len()!=1 {return Err(bad("Resource must match one discovered device"));}
     let _guard = s.mutation.lock().await;
     let mut tx = s.pool.begin().await?;
     sqlx::query("INSERT INTO resources(id,body) VALUES(?,?)").bind(&resource.id)

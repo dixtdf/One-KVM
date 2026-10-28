@@ -18,7 +18,12 @@ async fn call(app: &Router, method: &str, path: &str, token: &str, data: Value) 
 async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();let pool = store::open(&dir.path().join("test.db")).await.unwrap();
     store::bootstrap(&pool,"admin","admin-test-password").await.unwrap();
-    let app = router(Service::new(pool.clone()));
+    let inventory=(0..32).map(|n|one_kvm_platform_service::discovery::Candidate {
+        id:format!("candidate-{n}"),label:format!("device-{n}"),
+        kind:if n%2==0 {"video"}else{"control"}.into(),selector_kind:"port".into(),
+        selector:format!("port-{n}"),physical_interface:format!("physical-{n}"),current_path:format!("/dev/fixture-{n}"),
+    }).collect();
+    let app = router(Service::with_inventory(pool.clone(),one_kvm_platform_service::discovery::Inventory::Fixed(inventory)));
     let (status,response)=call(&app,"POST","/auth/login","",json!({"username":"admin","password":"admin-test-password"})).await;
     assert_eq!(status,StatusCode::OK);
     Fixture { app,pool,_dir:dir,admin:response["token"].as_str().unwrap().into() }
@@ -106,6 +111,17 @@ async fn bootstrap_cannot_overwrite_existing_accounts_or_future_schema() {
     assert!(store::bootstrap(&f.pool,"another","another-password").await.is_err());
     sqlx::query("PRAGMA user_version=99").execute(&f.pool).await.unwrap();
     assert!(store::open(&f._dir.path().join("test.db")).await.is_err());
+}
+
+#[tokio::test]
+async fn discovery_requires_admin_and_registration_rejects_arbitrary_paths() {
+    let f=fixture().await;let (_,token)=viewer(&f).await;
+    assert_eq!(call(&f.app,"GET","/discovery",&token,Value::Null).await.0,StatusCode::FORBIDDEN);
+    let (status,items)=call(&f.app,"GET","/discovery",&f.admin,Value::Null).await;
+    assert_eq!(status,StatusCode::OK);assert!(!items.to_string().contains("current_path"));
+    assert_eq!(call(&f.app,"POST","/resources/register",&f.admin,json!({"candidate_id":"missing","name":"bad"})).await.0,StatusCode::BAD_REQUEST);
+    assert_eq!(call(&f.app,"POST","/resources/register",&f.admin,json!({"candidate_id":"candidate-0","name":"camera"})).await.0,StatusCode::OK);
+    assert_eq!(call(&f.app,"POST","/resources",&f.admin,json!({"id":"x","name":"bad","kind":"video","selector_kind":"port","selector":"/etc/shadow"})).await.0,StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
