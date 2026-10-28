@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>One-KVM 多设备管理</title><link rel="stylesheet" href="/platform.css"></head>
 <body><header><h1>One-KVM 多设备管理</h1><p id="identity">请登录管理服务</p><button id="logout" hidden>退出</button></header>
-<main><p id="notice" role="status">实验管理界面：当前可管理通道与授权，尚未开放视频和控制工作进程。</p>
+<main><p id="notice" role="status">选择获分配的设备。仅已启动的通道可连接，控制需单独申请。</p>
 <form id="login"><h2>登录</h2><label>用户名<input name="username" autocomplete="username" required></label><label>密码<input name="password" type="password" autocomplete="current-password" required></label><button>登录</button></form>
 <section id="workspace" hidden><div class="heading"><h2>我的设备</h2><button id="refresh">刷新</button></div><div id="channels" class="grid"></div>
 <section id="administration" hidden><h2>管理员</h2><div class="grid">
@@ -9,4 +9,4 @@
 <form id="channel"><h3>添加通道</h3><label>设备名称<input name="name" required maxlength="128"></label><label>视频资源<select name="video" required></select></label><label>控制资源<select name="control"><option value="">仅观看</option></select></label><label>自定义 RustDesk ID<input name="rustdesk_id" autocomplete="off"></label><p>新通道默认停用，待运行隔离验收后启用。</p><button>添加</button></form>
 <form id="user"><h3>添加用户</h3><label>用户名<input name="username" required autocomplete="off"></label><label>初始密码<input name="password" type="password" minlength="8" required autocomplete="new-password"></label><button>创建普通用户</button></form>
 <form id="grant"><h3>分配通道权限</h3><label>用户<select name="user" required></select></label><label>通道<select name="channel" required></select></label><label>权限<select name="role"><option value="viewer">查看</option><option value="operator">查看与控制</option><option value="manager">通道管理</option></select></label><button>分配</button><button type="button" id="revoke">撤销</button></form>
-</div></section></section></main><script src="/platform.js" defer></script></body></html>
+</div></section></section></main><script src="/console.js" defer></script><script src="/platform.js" defer></script></body></html>

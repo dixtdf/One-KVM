@@ -91,6 +91,7 @@ pub fn router(service: Arc<Service>) -> Router {
     Router::new()
         .route("/",get(|| async {Html(include_str!("../web/index.html"))}))
         .route("/platform.js",get(||async { ([("content-type","text/javascript; charset=utf-8")],include_str!("../web/platform.js")) }))
+        .route("/console.js",get(||async { ([("content-type","text/javascript; charset=utf-8")],include_str!("../web/console.js")) }))
         .route("/platform.css",get(||async { ([("content-type","text/css; charset=utf-8")],include_str!("../web/platform.css")) }))
         .route("/health", get(|| async { Json(json!({"status":"ok","stage":"metadata-only"})) }))
         .route("/auth/login", post(login)).merge(protected)
