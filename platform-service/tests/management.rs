@@ -178,6 +178,39 @@ async fn video_sessions_are_bound_to_channel_and_login_and_closed_after_revoke()
 }
 
 #[tokio::test]
+async fn input_requires_operator_and_exclusive_lease_and_revoke_sends_neutral_reset() {
+    use std::{net::TcpListener,io::{Read,Write}};
+    let f=fixture().await;let c=channel(&f,1).await;let id=c["id"].as_str().unwrap();let (user,token)=viewer(&f).await;
+    let listener=TcpListener::bind("127.0.0.1:0").unwrap();let port=listener.local_addr().unwrap().port();
+    let server=std::thread::spawn(move ||{
+        let mut packets=vec![];
+        for _ in 0..3 {
+            let (mut stream,_)=listener.accept().unwrap();stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut bytes=vec![];let mut byte=[0];while !bytes.ends_with(b"\r\n\r\n"){stream.read_exact(&mut byte).unwrap();bytes.push(byte[0]);}
+            let head=String::from_utf8(bytes).unwrap();assert!(head.starts_with("POST /api/platform/input "));
+            let len:usize=head.lines().find_map(|line|line.strip_prefix("Content-Length: ")).unwrap().trim().parse().unwrap();
+            let mut data=vec![0;len];stream.read_exact(&mut data).unwrap();packets.push(serde_json::from_slice::<Value>(&data).unwrap());
+            stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 17\r\n\r\n{\"accepted\":true}").unwrap();
+        }
+        packets
+    });
+    let service=Service::new(f.pool.clone());service.attach_worker(id.into(),one_kvm_platform_service::gateway::WorkerEndpoint{port,session:"worker-private".into()}).await;let app=router(service.clone());
+    let acquire=format!("/channels/{id}/control/acquire");let input=format!("/channels/{id}/control/input");let grant=format!("/grants/{user}/{id}");
+    call(&app,"PUT",&grant,&f.admin,json!({"role":"viewer"})).await;
+    assert_eq!(call(&app,"POST",&acquire,&token,Value::Null).await.0,StatusCode::FORBIDDEN);
+    call(&app,"PUT",&grant,&f.admin,json!({"role":"operator"})).await;
+    assert_eq!(call(&app,"POST",&input,&token,json!([1,0,4,0])).await.0,StatusCode::FORBIDDEN);
+    assert_eq!(call(&app,"POST",&acquire,&token,Value::Null).await.0,StatusCode::OK);
+    assert_eq!(call(&app,"POST",&acquire,&f.admin,Value::Null).await.0,StatusCode::CONFLICT);
+    assert_eq!(call(&app,"POST",&input,&token,json!([1,0])).await.0,StatusCode::BAD_REQUEST);
+    assert_eq!(call(&app,"POST",&input,&token,json!([1,0,4,0])).await.0,StatusCode::OK);
+    call(&app,"DELETE",&grant,&f.admin,Value::Null).await;
+    assert_eq!(call(&app,"POST",&input,&token,json!([1,1,4,0])).await.0,StatusCode::FORBIDDEN);
+    service.sweep_controls().await.unwrap();
+    assert_eq!(server.join().unwrap(),vec![json!([]),json!([1,0,4,0]),json!([])]);
+}
+
+#[tokio::test]
 async fn login_throttle_and_unknown_payloads_do_not_escalate_privileges() {
     let f=fixture().await;
     for _ in 0..5 {
