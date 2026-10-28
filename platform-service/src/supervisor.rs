@@ -11,10 +11,11 @@ pub struct Supervisor {
     sha256:String,
     reservations:Arc<Reservations>,
     running:BTreeMap<String,Running>,
+    recovery_required:BTreeSet<String>,
 }
 impl Supervisor {
     pub fn new(executable:PathBuf,sha256:String,reservations:Arc<Reservations>)->Self {
-        Self{executable,sha256,reservations,running:BTreeMap::new()}
+        Self{executable,sha256,reservations,running:BTreeMap::new(),recovery_required:BTreeSet::new()}
     }
     pub fn start(&mut self,id:&str,data_dir:&Path,interfaces:BTreeSet<String>,owns_otg:bool)->Result<(),String> {
         let bytes=fs::read(&self.executable).map_err(|_|"Cannot read worker executable")?;
@@ -44,7 +45,7 @@ impl Supervisor {
         for (id,worker) in &mut self.running {
             if worker.child.try_wait().map_err(|_|"Cannot inspect worker")?.is_some(){exited.push(id.clone());}
         }
-        for id in &exited {self.running.remove(id);self.reservations.release_after_exit(id).map_err(str::to_owned)?;}
+        for id in &exited {self.running.remove(id);self.recovery_required.insert(id.clone());}
         Ok(exited)
     }
     /// A hard kill does not prove HID reports have been released. The caller must
@@ -56,7 +57,14 @@ impl Supervisor {
             worker.child.kill().map_err(|_|"Cannot stop worker")?;
         }
         worker.child.wait().map_err(|_|"Cannot confirm worker exit")?;
-        self.running.remove(id);self.reservations.release_after_exit(id).map_err(str::to_owned)?;Ok(())
+        self.running.remove(id);self.recovery_required.insert(id.into());Ok(())
+    }
+    /// Only the trusted hardware adapter calls this after neutral HID reports
+    /// and gadget state recovery. Process exit alone cannot prove key release.
+    pub fn confirm_input_recovered(&mut self,id:&str)->Result<(),String> {
+        if !self.recovery_required.contains(id){return Err("Channel is not awaiting recovery".into());}
+        self.reservations.release_after_exit(id).map_err(str::to_owned)?;
+        self.recovery_required.remove(id);Ok(())
     }
     /// Offline/replaced devices stop only their owning workers; no automatic
     /// fallback to another source, and no global OTG restart.
@@ -93,8 +101,11 @@ mod tests {
         s.start("b",dir.path(),BTreeSet::from(["camera-b".into()]),false).unwrap();
         assert!(r.acquire("c",BTreeSet::from(["camera-a".into()])).is_err());
         assert_eq!(s.stop_missing(&BTreeSet::from(["camera-b".into()])).unwrap(),vec!["a"]);
-        r.acquire("c",BTreeSet::from(["camera-a".into()])).unwrap();assert!(r.acquire("d",BTreeSet::from(["camera-b".into()])).is_err());
-        s.kill_and_wait("b").unwrap();r.acquire("d",BTreeSet::from(["camera-b".into()])).unwrap();
+        assert!(r.acquire("c",BTreeSet::from(["camera-a".into()])).is_err());
+        s.confirm_input_recovered("a").unwrap();r.acquire("c",BTreeSet::from(["camera-a".into()])).unwrap();
+        assert!(r.acquire("d",BTreeSet::from(["camera-b".into()])).is_err());
+        s.kill_and_wait("b").unwrap();assert!(r.acquire("d",BTreeSet::from(["camera-b".into()])).is_err());
+        s.confirm_input_recovered("b").unwrap();r.acquire("d",BTreeSet::from(["camera-b".into()])).unwrap();
     }
     #[test]
     fn executable_change_and_wrong_otg_claim_fail_before_launch(){
