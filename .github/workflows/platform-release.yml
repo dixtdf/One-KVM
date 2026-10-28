@@ -2,10 +2,13 @@ name: Build experimental platform ARM64 manager
 on:
   push:
     branches: ["codex/multi-channel-platform"]
-    paths: [".github/workflows/platform-release.yml"]
+    paths: [".github/workflows/platform-release.yml", "platform-service/**", "platform-core/**", "scripts/package-platform.py"]
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: platform-manager-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   manager:
     runs-on: ubuntu-24.04-arm
