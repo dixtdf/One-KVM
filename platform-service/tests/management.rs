@@ -211,6 +211,30 @@ async fn input_requires_operator_and_exclusive_lease_and_revoke_sends_neutral_re
 }
 
 #[tokio::test]
+async fn runtime_configuration_preserves_arbitrary_key_without_returning_secrets() {
+    let f=fixture().await;let channel=channel(&f,1).await;let id=channel["id"].as_str().unwrap();
+    let (user,token)=viewer(&f).await;let path=format!("/channels/{id}/runtime/config");
+    assert_eq!(call(&f.app,"GET",&path,&token,Value::Null).await.0,StatusCode::FORBIDDEN);
+    call(&f.app,"PUT",&format!("/grants/{user}/{id}"),&f.admin,json!({"role":"manager"})).await;
+    let update=json!({"fps":25,"relay_key":" arbitrary key \n","device_password":"manual-device-password","rendezvous_server":"example.invalid:21116"});
+    assert_eq!(call(&f.app,"PATCH",&path,&token,update).await.0,StatusCode::OK);
+    let (_,response)=call(&f.app,"GET",&path,&token,Value::Null).await;
+    assert_eq!(response["rustdesk"]["key_set"],true);assert_eq!(response["rustdesk"]["password_set"],true);
+    assert!(!response.to_string().contains("manual-device-password"));assert!(!response.to_string().contains("arbitrary key"));
+    call(&f.app,"PATCH",&path,&token,json!({"fps":30,"device_password":""})).await;
+    let raw:String=sqlx::query_scalar("SELECT value FROM metadata WHERE key=?").bind(format!("worker_template:{id}")).fetch_one(&f.pool).await.unwrap();
+    let template:Value=serde_json::from_str(&raw).unwrap();assert_eq!(template["rustdesk"]["relay_key"]," arbitrary key \n");
+    assert_eq!(template["rustdesk"]["device_password"],"manual-device-password");
+    assert_eq!(call(&f.app,"PATCH",&path,&token,json!({"device_password":"bad"})).await.0,StatusCode::BAD_REQUEST);
+    assert_eq!(call(&f.app,"PATCH",&path,&token,json!({"fps":0})).await.0,StatusCode::BAD_REQUEST);
+    assert_eq!(call(&f.app,"PATCH",&path,&token,json!({"executable":"/bin/sh"})).await.0,StatusCode::UNPROCESSABLE_ENTITY);
+    call(&f.app,"PATCH",&path,&token,json!({"relay_key":""})).await;
+    assert_eq!(call(&f.app,"GET",&path,&token,Value::Null).await.1["rustdesk"]["key_set"],false);
+    assert_eq!(call(&f.app,"POST",&format!("/channels/{id}/runtime/start"),&token,Value::Null).await.0,StatusCode::FORBIDDEN);
+    assert_eq!(call(&f.app,"POST",&format!("/channels/{id}/runtime/start"),&f.admin,Value::Null).await.0,StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
 async fn login_throttle_and_unknown_payloads_do_not_escalate_privileges() {
     let f=fixture().await;
     for _ in 0..5 {
