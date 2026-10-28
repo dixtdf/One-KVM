@@ -3,6 +3,7 @@ pub mod model;
 pub mod discovery;
 pub mod migration;
 pub mod runtime;
+pub mod supervisor;
 pub mod store;
 mod web;
 pub use web::{router, Service};
