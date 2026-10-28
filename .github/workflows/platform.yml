@@ -21,6 +21,11 @@ jobs:
           persist-credentials: false
       - name: Check existing patches against exact upstream
         run: python3 custom/scripts/prepare.py source
+      - name: Test browser console input lifecycle
+        run: |
+          node --check custom/platform-service/web/platform.js
+          node --check custom/platform-service/web/console.js
+          node custom/scripts/test-console.cjs
       - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install 1.99.1 --profile minimal
