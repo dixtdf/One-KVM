@@ -55,7 +55,10 @@ pub fn plan(channel:&Channel,resources:&[Resource],inventory:&[Candidate],templa
         },
         None=>config["hid"]["backend"]=json!("none"),
     }
-    config["rustdesk"]["device_id"]=json!(channel.rustdesk_id);
+    config["rustdesk"]["device_id"]=json!(channel.rustdesk_id.as_deref().unwrap_or(""));
+    if config["rustdesk"]["enabled"]==true && channel.rustdesk_id.as_ref().is_none_or(|id|id.is_empty()) {
+        return Err("Enabled RustDesk requires a channel ID");
+    }
     config["rustdesk"]["direct_access_port"]=json!(rustdesk_port);
     config["web"]["bind_address"]=json!("127.0.0.1");
     config["web"]["bind_addresses"]=json!(["127.0.0.1"]);

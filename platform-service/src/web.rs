@@ -84,6 +84,7 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/channels/{id}/control/input", post(control_input))
         .route("/channels/{id}/runtime/start", post(runtime_start))
         .route("/channels/{id}/runtime/stop", post(runtime_stop))
+        .route("/channels/{id}/runtime/config", get(runtime_config).patch(runtime_config_update))
         .route_layer(middleware::from_fn_with_state(service.clone(), authenticate));
     Router::new()
         .route("/",get(|| async {Html(include_str!("../web/index.html"))}))
@@ -400,6 +401,58 @@ async fn runtime_start(State(s):State<Arc<Service>>,Extension(p):Extension<Princ
     s.workers.lock().await.insert(id.clone(),endpoint);
     let mut tx=s.pool.begin().await?;store::audit(&mut tx,&p.0.id,"start_channel",&id).await?;tx.commit().await?;
     Ok(Json(json!({"running":true})))
+}
+
+async fn channel_config_permission(s:&Service,p:&Principal,id:&str)->Result<()> {
+    let channel=store::channels(&s.pool).await.map_err(|_|bad("Invalid channel data"))?.into_iter().find(|c|c.id==id).ok_or_else(forbidden)?;
+    if !allowed(s,p,&channel,Permission::Configure).await?{return Err(forbidden());}Ok(())
+}
+async fn private_template(s:&Service,id:&str)->Result<Value>{
+    let raw:Option<String>=sqlx::query_scalar("SELECT value FROM metadata WHERE key=?").bind(format!("worker_template:{id}")).fetch_optional(&s.pool).await?;
+    match raw {Some(raw)=>serde_json::from_str(&raw).map_err(|_|bad("Invalid private template")),None=>Ok(json!({
+        "video":{"width":1920,"height":1080,"fps":30},"stream":{"mode":"webrtc"},
+        "hid":{"backend":"none","otg_profile":"full_no_consumer"},
+        "rustdesk":{"enabled":false,"mode":"id","codec":"h264"}
+    }))}
+}
+async fn runtime_config(State(s):State<Arc<Service>>,Extension(p):Extension<Principal>,Path(id):Path<String>)->Result<Json<Value>> {
+    channel_config_permission(&s,&p,&id).await?;let template=private_template(&s,&id).await?;
+    Ok(Json(json!({"video":template.get("video"),"rustdesk":{
+        "enabled":template.pointer("/rustdesk/enabled"),"rendezvous_server":template.pointer("/rustdesk/rendezvous_server"),
+        "relay_server":template.pointer("/rustdesk/relay_server"),"codec":template.pointer("/rustdesk/codec"),
+        "key_set":template.pointer("/rustdesk/relay_key").and_then(Value::as_str).is_some_and(|s|!s.is_empty()),
+        "password_set":template.pointer("/rustdesk/device_password").and_then(Value::as_str).is_some_and(|s|!s.is_empty())
+    }})))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeUpdate {
+    width:Option<u32>,height:Option<u32>,fps:Option<u32>,format:Option<String>,
+    rustdesk_enabled:Option<bool>,rendezvous_server:Option<String>,relay_server:Option<String>,
+    relay_key:Option<String>,device_password:Option<String>,
+}
+async fn runtime_config_update(State(s):State<Arc<Service>>,Extension(p):Extension<Principal>,Path(id):Path<String>,Json(req):Json<RuntimeUpdate>)->Result<Json<Value>> {
+    let _guard=s.mutation.lock().await;channel_config_permission(&s,&p,&id).await?;
+    if s.workers.lock().await.contains_key(&id){return Err(bad("Stop the channel before changing runtime config"));}
+    if req.width.is_some_and(|n|n==0||n>8192)||req.height.is_some_and(|n|n==0||n>8192)||req.fps.is_some_and(|n|n==0||n>240){return Err(bad("Invalid capture geometry or frame rate"));}
+    if req.device_password.as_ref().is_some_and(|s|!s.is_empty()&&s.len()<6){return Err(bad("Device password requires at least six UTF-8 bytes"));}
+    let mut template=private_template(&s,&id).await?;
+    if let Some(v)=req.width{template["video"]["width"]=json!(v);}
+    if let Some(v)=req.height{template["video"]["height"]=json!(v);}
+    if let Some(v)=req.fps{template["video"]["fps"]=json!(v);}
+    if let Some(v)=req.format{template["video"]["format"]=json!(v);}
+    if let Some(v)=req.rustdesk_enabled{template["rustdesk"]["enabled"]=json!(v);}
+    if let Some(v)=req.rendezvous_server{template["rustdesk"]["rendezvous_server"]=json!(v);}
+    if let Some(v)=req.relay_server{template["rustdesk"]["relay_server"]=json!(v);}
+    if let Some(v)=req.relay_key{template["rustdesk"]["relay_key"]=if v.is_empty(){Value::Null}else{json!(v)};}
+    if let Some(v)=req.device_password{if !v.is_empty(){template["rustdesk"]["device_password"]=json!(v);}}
+    // Each fresh channel gets its own identity keys from the worker defaults.
+    // Existing imported private keys are preserved verbatim in this template.
+    let mut tx=s.pool.begin().await?;
+    sqlx::query("INSERT INTO metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+        .bind(format!("worker_template:{id}")).bind(template.to_string()).execute(&mut *tx).await?;
+    store::audit(&mut tx,&p.0.id,"update_runtime_config",&id).await?;tx.commit().await?;
+    Ok(Json(json!({"saved":true})))
 }
 async fn runtime_stop(State(s):State<Arc<Service>>,Extension(p):Extension<Principal>,Path(id):Path<String>)->Result<Json<Value>>{
     admin(&p)?;let _guard=s.mutation.lock().await;
