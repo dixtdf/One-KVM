@@ -11,7 +11,7 @@ pub fn now() -> i64 {
 }
 
 pub fn token_hash(token: &str) -> String {
-    format!("{:x}", Sha256::digest(token.as_bytes()))
+    Sha256::digest(token.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub fn password_hash(password: &str) -> Result<String, String> {

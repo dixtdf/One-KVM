@@ -32,7 +32,7 @@ impl Candidate {
     }
 }
 
-fn digest(value: &str) -> String { format!("{:x}",Sha256::digest(value.as_bytes())) }
+fn digest(value: &str) -> String { Sha256::digest(value.as_bytes()).iter().map(|b|format!("{b:02x}")).collect() }
 fn text(path: &Path) -> Option<String> { fs::read_to_string(path).ok().map(|s|s.trim().to_owned()).filter(|s|!s.is_empty()) }
 fn usb_model(interface: &Path) -> String {
     // Include model and interface in the port binding. A different device plugged
