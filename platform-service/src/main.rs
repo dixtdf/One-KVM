@@ -29,6 +29,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Administrator initialized; no listener started");
         return Ok(());
     }
+    if args.len() == 5 && args[3] == "--import-legacy" {
+        let inventory=one_kvm_platform_service::discovery::discover(std::path::Path::new("/sys"),std::path::Path::new("/dev"));
+        one_kvm_platform_service::migration::import_legacy(&pool,std::path::Path::new(&args[4]),&dir.join("backups"),&inventory)
+            .await.map_err(io::Error::other)?;
+        println!("Legacy config imported; channel remains disabled; no listener started");
+        return Ok(());
+    }
     if args.len() != 3 { return Err("Unknown arguments".into()); }
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE active=1 AND admin=1").fetch_one(&pool).await?;
     if count == 0 { return Err("Initialize an administrator with --bootstrap before serving".into()); }
