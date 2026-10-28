@@ -45,6 +45,13 @@ window.PlatformConsole = class {
       const servers = await this.api(this.path('video/ice-servers'));
       if (generation !== this.generation) return;
       peer = new RTCPeerConnection({ iceServers: servers.ice_servers || [] }); this.peer = peer;
+      const pendingIce = [];
+      peer.onicecandidate = event => {
+        if (!event.candidate || generation !== this.generation) return;
+        const candidate = event.candidate.toJSON();
+        if (!this.session) pendingIce.push(candidate);
+        else this.api(this.path('video/ice'), 'POST', { session_id: this.session, candidate }).catch(e => this.report(e.message, true));
+      };
       peer.ontrack = event => { if (generation === this.generation) this.video.srcObject = event.streams[0] || new MediaStream([event.track]); };
       peer.onconnectionstatechange = () => {
         if (generation !== this.generation) return;
@@ -54,9 +61,11 @@ window.PlatformConsole = class {
       peer.addTransceiver('video', { direction: 'recvonly' });
       // No WebRTC input data channel: keyboard/mouse must pass the gateway.
       await peer.setLocalDescription(await peer.createOffer());
-      await new Promise((resolve, reject) => {
+      await new Promise(resolve => {
         if (peer.iceGatheringState === 'complete') return resolve();
-        const timer = setTimeout(() => { peer.removeEventListener('icegatheringstatechange', check); reject(new Error('ICE 收集超时')); }, 10000);
+        // Local host candidates are usable without waiting for an unreachable
+        // public STUN service. Further candidates use authenticated trickle ICE.
+        const timer = setTimeout(() => { peer.removeEventListener('icegatheringstatechange', check); resolve(); }, 750);
         const check = () => { if (peer.iceGatheringState === 'complete') { clearTimeout(timer); peer.removeEventListener('icegatheringstatechange', check); resolve(); } };
         peer.addEventListener('icegatheringstatechange', check);
       });
@@ -64,6 +73,7 @@ window.PlatformConsole = class {
       const answer = await this.api(this.path('video/offer'), 'POST', { sdp: peer.localDescription.sdp });
       if (generation !== this.generation) { await this.api(this.path('video/close'), 'POST', { session_id: answer.session_id }); return; }
       this.session = answer.session_id; await peer.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
+      for (const candidate of pendingIce) await this.api(this.path('video/ice'), 'POST', { session_id: this.session, candidate });
       for (const candidate of answer.ice_candidates || []) await peer.addIceCandidate(candidate);
     } catch (e) { if (generation === this.generation) { await this.close(); this.state.textContent = '连接失败'; } throw e; }
     finally { this.connect.disabled = false; if (generation !== this.generation && peer) peer.close(); }

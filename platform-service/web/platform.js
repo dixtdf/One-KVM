@@ -18,6 +18,7 @@ async function api(path, method = 'GET', body) {
 }
 function reset() {
   closeConsoles();
+  notice('请登录管理服务。');
   token = ''; currentUser = null; $('workspace').hidden = true; $('administration').hidden = true;
   $('login').hidden = false; $('logout').hidden = true; $('identity').textContent = '请登录管理服务';
   $('channels').replaceChildren();
