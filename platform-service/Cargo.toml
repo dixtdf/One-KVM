@@ -1,0 +1,22 @@
+[package]
+name = "one-kvm-platform-service"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+publish = false
+
+[dependencies]
+one-kvm-platform-core = { path = "../platform-core" }
+axum = "=0.8.9"
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "sqlite-bundled"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+argon2 = "=0.5.3"
+uuid = { version = "=1.26.1", features = ["v4"] }
+sha2 = "=0.11.0"
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+tower = { version = "=0.5.3", features = ["util"] }
+http-body-util = "=0.1.5"

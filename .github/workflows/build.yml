@@ -43,6 +43,12 @@ jobs:
           rustup default 1.99.1
       - name: Test patched config and custom values
         run: python3 custom/scripts/test-config.py source custom/test-harness
+      - name: Test experimental channel domain model (not a runtime feature)
+        run: cargo test --manifest-path custom/platform-core/Cargo.toml --locked
+      - name: Test platform manager and OTG ownership compatibility
+        run: |
+          cargo test --manifest-path custom/platform-service/Cargo.toml --locked
+          python3 custom/scripts/test-otg-ownership.py source custom/out/otg-ownership-harness
       - name: Install cross
         run: cargo install cross --version 0.2.5 --locked
       - name: Build ARM64 using pinned Debian 12 image
@@ -60,6 +66,7 @@ jobs:
           cp source/web/package-lock.json custom/out/frontend-package-lock.json
           cp source/LICENSE custom/out/LICENSE
           cp custom/README.md custom/out/README.md
+          tar -C custom --exclude=target --exclude=__pycache__ -czf custom/out/platform-source.tar.gz platform-core platform-service scripts docs LICENSE
           cd custom/out
           sha256sum *.deb *.patch *.tar.gz > SHA256SUMS
       - name: Upload build output

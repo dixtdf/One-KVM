@@ -1,0 +1,83 @@
+--- a/src/hid/websocket.rs
++++ b/src/hid/websocket.rs
+@@ -98,6 +98,28 @@
+     info!("WebSocket HID connection ended");
+ }
+ 
++/// Restricted worker input adapter. Existing authenticated /api middleware
++/// remains mandatory; only the manager knows the random internal credentials.
++pub async fn platform_input(
++    State(state): State<Arc<AppState>>,
++    axum::Json(data): axum::Json<Vec<u8>>,
++) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
++    use axum::http::StatusCode;
++    if std::env::var("ONE_KVM_PLATFORM_WORKER").as_deref() != Ok("1") {
++        return (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error":"Unavailable"})));
++    }
++    if data.len() > 7 {
++        return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error":"Invalid input"})));
++    }
++    let result = if data.is_empty() {
++        state.hid.reset_confirmed().await.map_err(|_| "Cannot reset input".to_string())
++    } else { handle_binary_message(&data, &state).await };
++    match result {
++        Ok(()) => (StatusCode::OK, axum::Json(serde_json::json!({"accepted":true}))),
++        Err(_) => (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error":"Input rejected"}))),
++    }
++}
++
+ async fn handle_binary_message(data: &[u8], state: &AppState) -> Result<(), String> {
+     let event = parse_hid_message(data).ok_or("Invalid binary HID message")?;
+ 
+--- a/src/web/routes.rs
++++ b/src/web/routes.rs
+@@ -106,6 +106,7 @@
+             get(handlers::hid_ch9329_descriptor),
+         )
+         .route("/hid/reset", post(handlers::hid_reset))
++        .route("/platform/input", post(crate::hid::websocket::platform_input))
+         // WebSocket HID endpoint (for MJPEG mode)
+         .route("/ws/hid", any(ws_hid_handler))
+         // Audio endpoints
+--- a/src/hid/mod.rs
++++ b/src/hid/mod.rs
+@@ -120,6 +120,7 @@
+     Mouse(MouseEvent),
+     Consumer(ConsumerEvent),
+     Reset,
++    ResetConfirmed(tokio::sync::oneshot::Sender<bool>),
+ }
+ 
+ pub struct HidController {
+@@ -339,6 +340,19 @@
+         self.enqueue_event(QueuedHidEvent::Reset).await
+     }
+ 
++    /// Confirm backend reset execution, rather than just accepting a queue item.
++    pub async fn reset_confirmed(&self) -> Result<()> {
++        if !self.backend_available.load(Ordering::Acquire) {
++            return Err(AppError::BadRequest("HID backend is unavailable".into()));
++        }
++        let (tx, rx) = tokio::sync::oneshot::channel();
++        self.enqueue_event(QueuedHidEvent::ResetConfirmed(tx)).await?;
++        match tokio::time::timeout(std::time::Duration::from_secs(3), rx).await {
++            Ok(Ok(true)) => Ok(()),
++            _ => Err(AppError::BadRequest("HID reset was not confirmed".into())),
++        }
++    }
++
+     pub async fn is_available(&self) -> bool {
+         self.backend_available.load(Ordering::Acquire)
+     }
+@@ -659,6 +673,11 @@
+                 QueuedHidEvent::Mouse(ev) => backend_for_send.send_mouse(ev).await,
+                 QueuedHidEvent::Consumer(ev) => backend_for_send.send_consumer(ev).await,
+                 QueuedHidEvent::Reset => backend_for_send.reset().await,
++                QueuedHidEvent::ResetConfirmed(ack) => {
++                    let result = backend_for_send.reset().await;
++                    let _ = ack.send(result.is_ok());
++                    result
++                },
+             }
+         })
+     })

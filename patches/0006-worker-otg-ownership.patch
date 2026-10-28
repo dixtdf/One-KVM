@@ -1,0 +1,70 @@
+--- a/src/otg/service.rs
++++ b/src/otg/service.rs
+@@ -185,6 +185,7 @@
+     network_bridge: Mutex<Option<NetworkBridgeRuntime>>,
+     desired: RwLock<OtgDesiredState>,
+     recovery_checked: AtomicBool,
++    ownership_lock: std::sync::Mutex<Option<std::fs::File>>,
+ }
+ 
+ impl OtgService {
+@@ -196,7 +197,28 @@
+             network_bridge: Mutex::new(None),
+             desired: RwLock::new(OtgDesiredState::default()),
+             recovery_checked: AtomicBool::new(false),
+-        }
++            ownership_lock: std::sync::Mutex::new(None),
++        }
++    }
++
++    // The process policy is immutable for its lifetime. Non-OTG workers must
++    // never run network recovery or configfs cleanup, including through APIs.
++    fn owns_otg(&self) -> Result<bool> {
++        match std::env::var("ONE_KVM_OTG_OWNERSHIP").as_deref() {
++            Ok("none") => return Ok(false),
++            Ok("owner") | Err(std::env::VarError::NotPresent) => {},
++            _ => return Err(AppError::Config("Invalid OTG ownership policy".into())),
++        }
++        let mut guard = self.ownership_lock.lock()
++            .map_err(|_| AppError::Config("OTG ownership lock poisoned".into()))?;
++        if guard.is_none() {
++            let file = std::fs::OpenOptions::new().create(true).truncate(false)
++                .write(true).open("/run/lock/one-kvm-otg.lock")
++                .map_err(|_| AppError::Config("Cannot open OTG ownership lock".into()))?;
++            file.try_lock().map_err(|_| AppError::Config("OTG belongs to another process".into()))?;
++            *guard = Some(file);
++        }
++        Ok(true)
+     }
+ 
+     pub fn is_available() -> bool {
+@@ -256,6 +278,13 @@
+         network: &OtgNetworkConfig,
+         uac: &UacConfig,
+     ) -> Result<()> {
++        if !self.owns_otg()? {
++            let desired = OtgDesiredState::from_config(hid, msd, network, uac)?;
++            if desired.hid_enabled() || desired.msd_enabled || desired.network_enabled() || desired.uac.enabled {
++                return Err(AppError::Config("OTG is not assigned to this worker".into()));
++            }
++            return Ok(());
++        }
+         if !self.recovery_checked.load(Ordering::SeqCst) {
+             if let Err(error) = NetworkBridgeRuntime::recover_stale_transaction() {
+                 let message = format!("Failed to recover stale OTG network transaction: {error}");
+@@ -343,6 +372,7 @@
+     }
+ 
+     async fn reconcile_gadget(&self) -> Result<()> {
++        if !self.owns_otg()? { return Err(AppError::Config("OTG is not assigned to this worker".into())); }
+         let desired = self.desired.read().await.clone();
+ 
+         debug!(
+@@ -619,6 +649,7 @@
+     }
+ 
+     pub async fn shutdown(&self) -> Result<()> {
++        if !self.owns_otg()? { return Ok(()); }
+         info!("Shutting down OTG service");
+ 
+         {

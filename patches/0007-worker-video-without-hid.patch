@@ -1,0 +1,15 @@
+--- a/src/runtime/builder.rs
++++ b/src/runtime/builder.rs
+@@ -120,7 +120,11 @@
+         let extensions = Arc::new(ExtensionManager::new());
+         tracing::info!("Extension manager initialized");
+ 
+-        webrtc.set_hid_controller(hid.clone()).await;
++        // Platform video sessions never receive a direct HID capability. Input
++        // must pass the channel gateway, which checks permissions per event.
++        if std::env::var("ONE_KVM_PLATFORM_WORKER").as_deref() != Ok("1") {
++            webrtc.set_hid_controller(hid.clone()).await;
++        }
+         webrtc.set_audio_controller(audio.clone()).await;
+         if config.audio.enabled {
+             if let Err(error) = webrtc.set_audio_enabled(true).await {
