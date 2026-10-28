@@ -1,5 +1,8 @@
 name: Build experimental platform ARM64 manager
 on:
+  push:
+    branches: ["codex/multi-channel-platform"]
+    paths: [".github/workflows/platform-release.yml"]
   workflow_dispatch:
 permissions:
   contents: read
