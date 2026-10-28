@@ -146,7 +146,7 @@ async fn video_status(State(s):State<Arc<Service>>,Extension(p):Extension<Princi
 impl Service {
     /// Close media sessions after logout, expiration, user disable or grant
     /// revocation. A failed close remains tracked and is retried next sweep.
-    pub async fn sweep_video_sessions(&self)->Result<(),String> {
+    pub async fn sweep_video_sessions(&self)->std::result::Result<(),String> {
         let snapshot:Vec<_>=self.video_sessions.lock().await.iter().map(|(id,o)|(id.clone(),o.user.clone(),o.token_hash.clone(),o.channel.clone(),o.endpoint.clone())).collect();
         for (sid,user,token,channel,endpoint) in snapshot {
             let row=sqlx::query("SELECT u.id,u.username,u.admin,u.active FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND u.id=? AND s.expires>? AND u.active=1")

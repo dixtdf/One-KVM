@@ -3,7 +3,9 @@
 //! modified. New data and an idempotency marker commit in one transaction.
 use crate::{discovery::Candidate, model::Channel, store};
 use argon2::PasswordHash;
-use serde_json::{json, Value};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use sqlx::{Row, SqlitePool, sqlite::{SqliteConnectOptions,SqlitePoolOptions}};
 use std::path::Path;
 use uuid::Uuid;
