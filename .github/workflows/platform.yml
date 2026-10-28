@@ -32,12 +32,6 @@ jobs:
           cargo test --manifest-path custom/platform-core/Cargo.toml --locked 2>&1 | tee custom/out/platform-tests.txt
       - name: Check existing ID, Key and config compatibility
         run: python3 custom/scripts/test-config.py source custom/test-harness
-      - name: Resolve initial manager lockfile
-        shell: bash
-        run: |
-          if [ ! -f custom/platform-service/Cargo.lock ]; then
-            cargo generate-lockfile --manifest-path custom/platform-service/Cargo.toml
-          fi
       - name: Test metadata manager authentication, persistence and channel API
         shell: bash
         run: |

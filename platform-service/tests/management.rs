@@ -52,6 +52,10 @@ async fn sessions_are_hashed_logout_and_expiration_apply_to_every_request() {
     assert_eq!(call(&f.app,"GET","/users","",Value::Null).await.0,StatusCode::UNAUTHORIZED);
     assert_eq!(call(&f.app,"POST","/auth/logout",&f.admin,Value::Null).await.0,StatusCode::OK);
     assert_eq!(call(&f.app,"GET","/auth/me",&f.admin,Value::Null).await.0,StatusCode::UNAUTHORIZED);
+    let (_,login)=call(&f.app,"POST","/auth/login","",json!({"username":"admin","password":"admin-test-password"})).await;
+    let token=login["token"].as_str().unwrap();
+    sqlx::query("UPDATE sessions SET expires=0").execute(&f.pool).await.unwrap();
+    assert_eq!(call(&f.app,"GET","/auth/me",token,Value::Null).await.0,StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
