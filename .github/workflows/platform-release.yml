@@ -1,0 +1,30 @@
+name: Build experimental platform ARM64 manager
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  manager:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Install exact toolchain
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+      - name: Test core and manager on ARM64
+        run: |
+          cargo test --manifest-path platform-core/Cargo.toml --locked
+          cargo test --manifest-path platform-service/Cargo.toml --locked
+      - name: Build ARM64 manager
+        run: cargo build --manifest-path platform-service/Cargo.toml --release --locked
+      - name: Package private experimental manager
+        run: |
+          python3 scripts/package-platform.py
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: experimental-platform-manager-arm64
+          path: platform-out/
+          retention-days: 30
+          if-no-files-found: error

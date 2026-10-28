@@ -15,10 +15,26 @@ pub async fn import_legacy(pool:&SqlitePool, source:&Path, backup_dir:&Path, inv
     let legacy=SqlitePoolOptions::new().max_connections(1).connect_with(
         SqliteConnectOptions::new().filename(source).read_only(true).create_if_missing(false))
         .await.map_err(|_|"Cannot open legacy database read-only")?;
+    std::fs::create_dir_all(backup_dir).map_err(|_|"Cannot create backup directory")?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(backup_dir,std::fs::Permissions::from_mode(0o700)).map_err(|_|"Cannot secure backup directory")?;
+    }
+    let backup=backup_dir.join(format!("legacy-{}.db",Uuid::new_v4()));
+    sqlx::query("VACUUM INTO ?").bind(backup.to_str().ok_or("Invalid backup path")?).execute(&legacy).await.map_err(|_|"Cannot snapshot legacy database")?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&backup,std::fs::Permissions::from_mode(0o600)).map_err(|_|"Cannot secure legacy snapshot")?;
+    }
+    legacy.close().await;
+    let legacy=SqlitePoolOptions::new().max_connections(1).connect_with(
+        SqliteConnectOptions::new().filename(&backup).read_only(true).create_if_missing(false))
+        .await.map_err(|_|"Cannot open consistent legacy snapshot")?;
     let users=sqlx::query("SELECT id,username,password_hash FROM users").fetch_all(&legacy).await.map_err(|_|"Invalid legacy users")?;
     if users.len()!=1 {return Err("Legacy import requires exactly one account".into());}
     let user=&users[0];let user_id:String=user.get("id");let username:String=user.get("username");let hash:String=user.get("password_hash");
-    PasswordHash::new(&hash).map_err(|_|"Unsupported legacy password hash")?;
+    let parsed=PasswordHash::new(&hash).map_err(|_|"Unsupported legacy password hash")?;
+    if !matches!(parsed.algorithm.as_str(),"argon2id"|"argon2i"|"argon2d"){return Err("Unsupported legacy password algorithm".into());}
     let totp_table:Option<String>=sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='table' AND name='user_totp_credentials'")
         .fetch_optional(&legacy).await.map_err(|_|"Cannot inspect legacy schema")?;
     if totp_table.is_some() {
@@ -44,17 +60,6 @@ pub async fn import_legacy(pool:&SqlitePool, source:&Path, backup_dir:&Path, inv
         "ch9329"=>Some(choose("control",config.pointer("/hid/ch9329_port").and_then(Value::as_str).ok_or("Missing serial port")?)?),
         _=>return Err("Unsupported legacy control backend".into()),
     };
-    std::fs::create_dir_all(backup_dir).map_err(|_|"Cannot create backup directory")?;
-    #[cfg(unix)] {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(backup_dir,std::fs::Permissions::from_mode(0o700)).map_err(|_|"Cannot secure backup directory")?;
-    }
-    let backup=backup_dir.join(format!("legacy-{}.db",Uuid::new_v4()));
-    sqlx::query("VACUUM INTO ?").bind(backup.to_str().ok_or("Invalid backup path")?).execute(&legacy).await.map_err(|_|"Cannot snapshot legacy database")?;
-    #[cfg(unix)] {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&backup,std::fs::Permissions::from_mode(0o600)).map_err(|_|"Cannot secure legacy snapshot")?;
-    }
     let channel_id=Uuid::new_v4().to_string();let video=video.resource("Imported video".into(),Uuid::new_v4().to_string());
     let control=control.map(|c|c.resource("Imported control".into(),Uuid::new_v4().to_string()));
     let channel=Channel {id:channel_id.clone(),name:"Imported computer".into(),enabled:false,video:video.id.clone(),
@@ -92,7 +97,7 @@ mod tests {
         store::bootstrap(&old,"legacy-admin","original-password").await.unwrap();
         sqlx::query("CREATE TABLE config(key TEXT PRIMARY KEY,value TEXT)").execute(&old).await.unwrap();
         let config=json!({"video":{"device":"/dev/video42"},"hid":{"backend":"otg","otg_udc":"fe980000.usb"},
-            "rustdesk":{"device_id":" 手填ID ","relay_key":"custom-secret","device_password":"device-secret"}});
+            "rustdesk":{"device_id":" 鎵嬪～ID ","relay_key":"custom-secret","device_password":"device-secret"}});
         sqlx::query("INSERT INTO config VALUES('app_config',?)").bind(config.to_string()).execute(&old).await.unwrap();old.close().await;
         let pool=store::open(&dir.path().join("platform.db")).await.unwrap();
         let inventory=vec![Candidate{id:"video".into(),label:"CSI".into(),kind:"video".into(),selector_kind:"builtin".into(),selector:"csi".into(),physical_interface:"csi".into(),current_path:"/dev/video42".into()},
@@ -106,7 +111,7 @@ mod tests {
         assert_eq!(id,import_legacy(&pool,&source,&dir.path().join("backup"),&[]).await.unwrap());
         assert_eq!(before,std::fs::read(&source).unwrap());
         let channels=store::channels(&pool).await.unwrap();assert_eq!(channels.len(),1);assert!(!channels[0].enabled);
-        assert_eq!(channels[0].rustdesk_id.as_deref(),Some(" 手填ID "));
+        assert_eq!(channels[0].rustdesk_id.as_deref(),Some(" 鎵嬪～ID "));
         assert!(!serde_json::to_string(&channels).unwrap().contains("secret"));
         let hash:String=sqlx::query_scalar("SELECT password_hash FROM users").fetch_one(&pool).await.unwrap();assert!(store::verify_password("original-password",&hash));
         let template:String=sqlx::query_scalar("SELECT value FROM metadata WHERE key LIKE 'worker_template:%'").fetch_one(&pool).await.unwrap();
