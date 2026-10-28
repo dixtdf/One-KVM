@@ -34,6 +34,7 @@ impl Supervisor {
         let spawned=Command::new(&self.executable).args(["--data-dir"]).arg(data_dir)
             .env_clear().env("PATH","/usr/sbin:/usr/bin:/sbin:/bin")
             .env("ONE_KVM_OTG_OWNERSHIP",if owns_otg{"owner"}else{"none"})
+            .env("ONE_KVM_PLATFORM_WORKER","1")
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
         match spawned {
             Ok(child)=>{self.running.insert(id.into(),Running{child,interfaces});Ok(())},

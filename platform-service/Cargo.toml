@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 one-kvm-platform-core = { path = "../platform-core" }
 axum = "=0.8.9"
-tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "sqlite-bundled"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"

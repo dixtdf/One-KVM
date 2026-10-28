@@ -18,7 +18,10 @@ pub struct Service {
     hashing_slots: Semaphore,
     dummy_hash: String,
     inventory: crate::discovery::Inventory,
+    workers:Mutex<BTreeMap<String,crate::gateway::WorkerEndpoint>>,
+    video_sessions:Mutex<BTreeMap<String,VideoOwner>>,
 }
+struct VideoOwner { user:String, token_hash:String, channel:String, endpoint:crate::gateway::WorkerEndpoint }
 
 impl Service {
     pub fn new(pool: SqlitePool) -> Arc<Self> {
@@ -29,8 +32,13 @@ impl Service {
     pub fn with_inventory(pool: SqlitePool, inventory: crate::discovery::Inventory) -> Arc<Self> {
         Arc::new(Self { pool, mutation: Mutex::new(()), login_failures: Mutex::new(BTreeMap::new()),
             inventory,
+            workers:Mutex::new(BTreeMap::new()),video_sessions:Mutex::new(BTreeMap::new()),
             hashing_slots: Semaphore::new(4),
             dummy_hash: store::password_hash(&Uuid::new_v4().to_string()).expect("Hash initialization failed") })
+    }
+    /// Called only by the trusted supervisor after worker readiness/login.
+    pub async fn attach_worker(&self,channel:String,endpoint:crate::gateway::WorkerEndpoint) {
+        self.workers.lock().await.insert(channel,endpoint);
     }
 }
 
@@ -60,6 +68,10 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/channels/{id}", put(update_channel).delete(delete_channel))
         .route("/grants/{user}/{channel}", put(grant).delete(revoke))
         .route("/channels/{id}/authorize/{action}", get(authorize_action))
+        .route("/channels/{id}/video/offer", post(video_offer))
+        .route("/channels/{id}/video/ice", post(video_ice))
+        .route("/channels/{id}/video/close", post(video_close))
+        .route("/channels/{id}/video/status", get(video_status))
         .route_layer(middleware::from_fn_with_state(service.clone(), authenticate));
     Router::new()
         .route("/",get(|| async {Html(include_str!("../web/index.html"))}))
@@ -88,8 +100,62 @@ async fn authenticate(State(s): State<Arc<Service>>, mut req: Request, next: Nex
     let row = sqlx::query("SELECT u.id,u.username,u.admin,u.active FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires>? AND u.active=1")
         .bind(store::token_hash(token)).bind(store::now()).fetch_optional(&s.pool).await?
         .ok_or(Error(StatusCode::UNAUTHORIZED, "Session expired"))?;
+    let token_hash=store::token_hash(token);
     req.extensions_mut().insert(Principal(store::user(&row)));
+    req.extensions_mut().insert(AuthenticatedToken(token_hash));
     Ok(next.run(req).await)
+}
+#[derive(Clone)]
+struct AuthenticatedToken(String);
+
+async fn authorized_video(s:&Service,p:&Principal,id:&str)->Result<crate::gateway::WorkerEndpoint> {
+    let channel=store::channels(&s.pool).await.map_err(|_|bad("Invalid channel data"))?.into_iter().find(|c|c.id==id).ok_or_else(forbidden)?;
+    if !channel.enabled || !allowed(s,p,&channel,Permission::View).await? {return Err(forbidden());}
+    s.workers.lock().await.get(id).cloned().ok_or(Error(StatusCode::SERVICE_UNAVAILABLE,"Channel worker is offline"))
+}
+async fn video_offer(State(s):State<Arc<Service>>,Extension(p):Extension<Principal>,Extension(token):Extension<AuthenticatedToken>,Path(id):Path<String>,Json(mut body):Json<Value>)->Result<Json<Value>> {
+    let endpoint=authorized_video(&s,&p,&id).await?;
+    if !body.is_object() || !body.get("sdp").is_some_and(Value::is_string) {return Err(bad("Missing video offer"));}
+    if let Some(object)=body.as_object_mut(){object.remove("client_id");}
+    // A viewer cannot request reuse of another peer's WebRTC session.
+    let reply=crate::gateway::video(endpoint.clone(),crate::gateway::VideoAction::Offer,body).await.map_err(|_|Error(StatusCode::BAD_GATEWAY,"Worker offer failed"))?;
+    let sid=reply.get("session_id").and_then(Value::as_str).ok_or(Error(StatusCode::BAD_GATEWAY,"Worker returned no session"))?;
+    s.video_sessions.lock().await.insert(sid.into(),VideoOwner{user:p.0.id,token_hash:token.0,channel:id,endpoint});
+    Ok(Json(reply))
+}
+async fn video_session_action(s:Arc<Service>,p:Principal,token:AuthenticatedToken,id:String,body:Value,action:crate::gateway::VideoAction)->Result<Json<Value>> {
+    let _=authorized_video(&s,&p,&id).await?;
+    let sid=body.get("session_id").and_then(Value::as_str).ok_or_else(forbidden)?.to_owned();
+    let endpoint={let sessions=s.video_sessions.lock().await;let owner=sessions.get(&sid).ok_or_else(forbidden)?;
+        if owner.user!=p.0.id || owner.token_hash!=token.0 || owner.channel!=id {return Err(forbidden());} owner.endpoint.clone()};
+    let reply=crate::gateway::video(endpoint,action,body).await.map_err(|_|Error(StatusCode::BAD_GATEWAY,"Worker signaling failed"))?;
+    if matches!(action,crate::gateway::VideoAction::Close){s.video_sessions.lock().await.remove(&sid);}
+    Ok(Json(reply))
+}
+async fn video_ice(State(s):State<Arc<Service>>,Extension(p):Extension<Principal>,Extension(token):Extension<AuthenticatedToken>,Path(id):Path<String>,Json(body):Json<Value>)->Result<Json<Value>> {
+    video_session_action(s,p,token,id,body,crate::gateway::VideoAction::Ice).await
+}
+async fn video_close(State(s):State<Arc<Service>>,Extension(p):Extension<Principal>,Extension(token):Extension<AuthenticatedToken>,Path(id):Path<String>,Json(body):Json<Value>)->Result<Json<Value>> {
+    video_session_action(s,p,token,id,body,crate::gateway::VideoAction::Close).await
+}
+async fn video_status(State(s):State<Arc<Service>>,Extension(p):Extension<Principal>,Path(id):Path<String>)->Result<Json<Value>> {
+    let endpoint=authorized_video(&s,&p,&id).await?;
+    Ok(Json(crate::gateway::video(endpoint,crate::gateway::VideoAction::Status,Value::Null).await.map_err(|_|Error(StatusCode::BAD_GATEWAY,"Worker status unavailable"))?))
+}
+
+impl Service {
+    /// Close media sessions after logout, expiration, user disable or grant
+    /// revocation. A failed close remains tracked and is retried next sweep.
+    pub async fn sweep_video_sessions(&self)->Result<(),String> {
+        let snapshot:Vec<_>=self.video_sessions.lock().await.iter().map(|(id,o)|(id.clone(),o.user.clone(),o.token_hash.clone(),o.channel.clone(),o.endpoint.clone())).collect();
+        for (sid,user,token,channel,endpoint) in snapshot {
+            let row=sqlx::query("SELECT u.id,u.username,u.admin,u.active FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND u.id=? AND s.expires>? AND u.active=1")
+                .bind(token).bind(user).bind(store::now()).fetch_optional(&self.pool).await.map_err(|_|"Session verification unavailable")?;
+            let valid=if let Some(row)=row {authorized_video(self,&Principal(store::user(&row)),&channel).await.is_ok()}else{false};
+            if !valid && crate::gateway::video(endpoint,crate::gateway::VideoAction::Close,json!({"session_id":sid})).await.is_ok(){self.video_sessions.lock().await.remove(&sid);}
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]

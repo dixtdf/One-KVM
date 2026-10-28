@@ -5,6 +5,7 @@ pub mod migration;
 pub mod runtime;
 pub mod supervisor;
 pub mod worker_db;
+pub mod gateway;
 pub mod store;
 mod web;
 pub use web::{router, Service};

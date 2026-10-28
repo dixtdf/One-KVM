@@ -42,9 +42,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // No network exposure until gateway/runtime isolation is complete.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:18080").await?;
     println!("Experimental metadata manager listening on 127.0.0.1:18080");
-    axum::serve(listener, router(Service::new(pool))).with_graceful_shutdown(async {
+    let service=Service::new(pool);
+    let monitor=service.clone();
+    let sweep=tokio::spawn(async move {
+        loop {tokio::time::sleep(std::time::Duration::from_secs(2)).await;let _=monitor.sweep_video_sessions().await;}
+    });
+    axum::serve(listener, router(service)).with_graceful_shutdown(async {
         let _ = tokio::signal::ctrl_c().await;
     }).await?;
+    sweep.abort();
     drop(lock);
     Ok(())
 }
