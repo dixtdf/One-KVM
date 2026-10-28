@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use crate::{model::{Channel, Principal, Resource, User}, store};
 use axum::{Json, Router, extract::{Path, State, Request, DefaultBodyLimit},
-    http::StatusCode, middleware::{self, Next}, response::{IntoResponse, Response},
+    http::StatusCode, middleware::{self, Next}, response::{IntoResponse, Response, Html},
     routing::{get, post, put, delete}, Extension};
 use one_kvm_platform_core::{self as core, Permission};
 use serde::Deserialize;
@@ -61,9 +61,24 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/grants/{user}/{channel}", put(grant).delete(revoke))
         .route("/channels/{id}/authorize/{action}", get(authorize_action))
         .route_layer(middleware::from_fn_with_state(service.clone(), authenticate));
-    Router::new().route("/health", get(|| async { Json(json!({"status":"ok","stage":"metadata-only"})) }))
+    Router::new()
+        .route("/",get(|| async {Html(include_str!("../web/index.html"))}))
+        .route("/platform.js",get(||async { ([("content-type","text/javascript; charset=utf-8")],include_str!("../web/platform.js")) }))
+        .route("/platform.css",get(||async { ([("content-type","text/css; charset=utf-8")],include_str!("../web/platform.css")) }))
+        .route("/health", get(|| async { Json(json!({"status":"ok","stage":"metadata-only"})) }))
         .route("/auth/login", post(login)).merge(protected)
-        .layer(DefaultBodyLimit::max(64 * 1024)).with_state(service)
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(middleware::from_fn(response_headers)).with_state(service)
+}
+
+async fn response_headers(req:Request,next:Next)->Response {
+    let mut response=next.run(req).await;
+    for (name,value) in [
+        ("cache-control","no-store"),("x-content-type-options","nosniff"),
+        ("referrer-policy","no-referrer"),
+        ("content-security-policy","default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"),
+    ] {response.headers_mut().insert(axum::http::HeaderName::from_static(name),axum::http::HeaderValue::from_static(value));}
+    response
 }
 
 async fn authenticate(State(s): State<Arc<Service>>, mut req: Request, next: Next) -> Result<Response> {

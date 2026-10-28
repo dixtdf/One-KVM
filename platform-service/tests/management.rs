@@ -129,6 +129,19 @@ async fn discovery_requires_admin_and_registration_rejects_arbitrary_paths() {
 }
 
 #[tokio::test]
+async fn management_shell_is_public_but_private_data_requires_authentication() {
+    let f=fixture().await;
+    let response=f.app.clone().oneshot(Request::builder().uri("/").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(response.status(),StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"],"no-store");
+    assert!(response.headers()["content-security-policy"].to_str().unwrap().contains("frame-ancestors 'none'"));
+    let html=String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(html.contains("platform.js"));assert!(!html.contains(&f.admin));
+    assert_eq!(call(&f.app,"GET","/channels","",Value::Null).await.0,StatusCode::UNAUTHORIZED);
+    assert_eq!(call(&f.app,"GET","/discovery","",Value::Null).await.0,StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn login_throttle_and_unknown_payloads_do_not_escalate_privileges() {
     let f=fixture().await;
     for _ in 0..5 {

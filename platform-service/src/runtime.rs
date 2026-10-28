@@ -66,6 +66,15 @@ pub fn plan(channel:&Channel,resources:&[Resource],inventory:&[Candidate],templa
     }
     // OTG network is globally visible, so no worker inherits legacy networking.
     config["otg_network"]["enabled"]=json!(false);
+    fn disable_extensions(value:&mut Value) {
+        if let Value::Object(object)=value {
+            for (key,item) in object {
+                if key=="enabled" { *item=json!(false); }
+                else {disable_extensions(item);}
+            }
+        }
+    }
+    if let Some(extensions)=config.get_mut("extensions") {disable_extensions(extensions);}
     Ok(WorkerPlan{private_config:config,physical_interfaces:resolved.values().map(|d|d.physical_interface.clone()).collect()})
 }
 
