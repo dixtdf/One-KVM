@@ -110,6 +110,15 @@ pub fn discover(sys: &Path, dev: &Path) -> Vec<Candidate> {
             add(&mut items,"control",format!("OTG {name}"),"builtin",format!("udc:{name}"),format!("udc:{name}"),format!("udc:{name}"));
         }
     }
+    // The managed CSI-to-NV12 bridge and its raw Unicam source are one capture
+    // pipeline, not two independent cameras. Prefer the already-running bridge.
+    let has_c792_bridge=items.iter().any(|i|i.kind=="video" && i.label=="C792-NV12");
+    for item in &mut items {
+        if item.kind=="video" && matches!(item.label.as_str(),"C792-NV12"|"unicam-image") {
+            item.physical_interface="pipeline:c792".into();
+        }
+    }
+    if has_c792_bridge {items.retain(|i|i.kind!="video" || i.label!="unicam-image");}
     items.sort_by(|a,b|a.id.cmp(&b.id).then(a.physical_interface.cmp(&b.physical_interface)));
     // udev may expose equivalent aliases for one interface. Merge those only;
     // identical identities on different interfaces must remain ambiguous.
