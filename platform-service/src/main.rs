@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service=Service::new(pool);
     let monitor=service.clone();
     let sweep=tokio::spawn(async move {
-        loop {tokio::time::sleep(std::time::Duration::from_secs(2)).await;let _=monitor.sweep_video_sessions().await;}
+        loop {tokio::time::sleep(std::time::Duration::from_secs(2)).await;let _=monitor.sweep_controls().await;let _=monitor.sweep_video_sessions().await;}
     });
     axum::serve(listener, router(service)).with_graceful_shutdown(async {
         let _ = tokio::signal::ctrl_c().await;

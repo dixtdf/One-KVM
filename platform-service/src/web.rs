@@ -20,6 +20,7 @@ pub struct Service {
     inventory: crate::discovery::Inventory,
     workers:Mutex<BTreeMap<String,crate::gateway::WorkerEndpoint>>,
     video_sessions:Mutex<BTreeMap<String,VideoOwner>>,
+    controls:Mutex<crate::control::Controls>,
 }
 struct VideoOwner { user:String, token_hash:String, channel:String, endpoint:crate::gateway::WorkerEndpoint }
 
@@ -33,6 +34,7 @@ impl Service {
         Arc::new(Self { pool, mutation: Mutex::new(()), login_failures: Mutex::new(BTreeMap::new()),
             inventory,
             workers:Mutex::new(BTreeMap::new()),video_sessions:Mutex::new(BTreeMap::new()),
+            controls:Mutex::new(crate::control::Controls::default()),
             hashing_slots: Semaphore::new(4),
             dummy_hash: store::password_hash(&Uuid::new_v4().to_string()).expect("Hash initialization failed") })
     }
@@ -72,6 +74,9 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/channels/{id}/video/ice", post(video_ice))
         .route("/channels/{id}/video/close", post(video_close))
         .route("/channels/{id}/video/status", get(video_status))
+        .route("/channels/{id}/control/acquire", post(control_acquire))
+        .route("/channels/{id}/control/release", post(control_release))
+        .route("/channels/{id}/control/input", post(control_input))
         .route_layer(middleware::from_fn_with_state(service.clone(), authenticate));
     Router::new()
         .route("/",get(|| async {Html(include_str!("../web/index.html"))}))
@@ -154,6 +159,53 @@ impl Service {
             let valid=if let Some(row)=row {authorized_video(self,&Principal(store::user(&row)),&channel).await.is_ok()}else{false};
             if !valid && crate::gateway::video(endpoint,crate::gateway::VideoAction::Close,json!({"session_id":sid})).await.is_ok(){self.video_sessions.lock().await.remove(&sid);}
         }
+        Ok(())
+    }
+}
+
+async fn authorized_control(s:&Service,p:&Principal,id:&str)->Result<crate::gateway::WorkerEndpoint> {
+    let channel=store::channels(&s.pool).await.map_err(|_|bad("Invalid channel data"))?.into_iter().find(|c|c.id==id).ok_or_else(forbidden)?;
+    if !allowed(s,p,&channel,Permission::Control).await? {return Err(forbidden());}
+    s.workers.lock().await.get(id).cloned().ok_or(Error(StatusCode::SERVICE_UNAVAILABLE,"Channel worker is offline"))
+}
+async fn control_acquire(State(s):State<Arc<Service>>,Extension(p):Extension<Principal>,Extension(token):Extension<AuthenticatedToken>,Path(id):Path<String>)->Result<Json<Value>> {
+    let mut controls=s.controls.lock().await;
+    let endpoint=authorized_control(&s,&p,&id).await?;
+    if controls.owns(&id,&p.0.id,&token.0) {controls.renew(&id);return Ok(Json(json!({"lease_seconds":15})));}
+    if controls.leases.contains_key(&id){return Err(Error(StatusCode::CONFLICT,"Control is occupied or awaiting input recovery"));}
+    crate::gateway::input(endpoint.clone(),vec![]).await.map_err(|_|Error(StatusCode::BAD_GATEWAY,"Cannot reset channel input"))?;
+    controls.leases.insert(id,crate::control::Lease{user:p.0.id,token:token.0,endpoint,deadline:std::time::Instant::now()+std::time::Duration::from_secs(15)});
+    Ok(Json(json!({"lease_seconds":15})))
+}
+async fn control_release(State(s):State<Arc<Service>>,Extension(p):Extension<Principal>,Extension(token):Extension<AuthenticatedToken>,Path(id):Path<String>)->Result<Json<Value>> {
+    let mut controls=s.controls.lock().await;
+    let lease=controls.leases.get(&id).ok_or_else(forbidden)?;
+    if lease.user!=p.0.id || lease.token!=token.0 {return Err(forbidden());}
+    crate::gateway::input(lease.endpoint.clone(),vec![]).await.map_err(|_|Error(StatusCode::BAD_GATEWAY,"Input release pending"))?;
+    controls.leases.remove(&id);Ok(Json(json!({"released":true})))
+}
+async fn control_input(State(s):State<Arc<Service>>,Extension(p):Extension<Principal>,Extension(token):Extension<AuthenticatedToken>,Path(id):Path<String>,Json(data):Json<Vec<u8>>)->Result<Json<Value>> {
+    // Only valid, bounded One-KVM packet shapes cross the gateway. Detailed
+    // canonical key/mouse validation remains in the existing worker parser.
+    let shape=match data.first(){Some(1)=>data.len()==4 && data[1]<=1,Some(2)=>data.len()==7 && data[1]<=4,Some(3)=>data.len()==3,_=>false};
+    if !shape{return Err(bad("Invalid input packet"));}
+    let mut controls=s.controls.lock().await;
+    let endpoint=authorized_control(&s,&p,&id).await?;
+    if !controls.owns(&id,&p.0.id,&token.0){return Err(forbidden());}
+    crate::gateway::input(endpoint,data).await.map_err(|_|Error(StatusCode::BAD_GATEWAY,"Worker input failed"))?;
+    controls.renew(&id);Ok(Json(json!({"accepted":true})))
+}
+impl Service {
+    pub async fn sweep_controls(&self)->std::result::Result<(),String> {
+        let mut controls=self.controls.lock().await;
+        let mut clear=vec![];
+        for (id,lease) in &controls.leases {
+            let row=sqlx::query("SELECT u.id,u.username,u.admin,u.active FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND u.id=? AND s.expires>? AND u.active=1")
+                .bind(&lease.token).bind(&lease.user).bind(store::now()).fetch_optional(&self.pool).await.map_err(|_|"Session verification unavailable")?;
+            let valid=if let Some(row)=row {lease.deadline>std::time::Instant::now() && authorized_control(self,&Principal(store::user(&row)),id).await.is_ok()}else{false};
+            if !valid && crate::gateway::input(lease.endpoint.clone(),vec![]).await.is_ok(){clear.push(id.clone());}
+        }
+        for id in clear {controls.leases.remove(&id);}
         Ok(())
     }
 }

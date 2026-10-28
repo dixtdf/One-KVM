@@ -64,6 +64,13 @@ pub async fn video(endpoint:WorkerEndpoint,action:VideoAction,body:Value)->Resul
         .await.map_err(|_|"Worker video task failed")?.map(|r|r.body)
 }
 
+pub async fn input(endpoint:WorkerEndpoint,data:Vec<u8>)->Result<(),String> {
+    if data.len()>7{return Err("Invalid input packet".into());}
+    tokio::task::spawn_blocking(move ||exchange(endpoint.port,"/api/platform/input",Some(serde_json::json!(data)),Some(endpoint.session)))
+        .await.map_err(|_|"Worker input task failed")??;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
