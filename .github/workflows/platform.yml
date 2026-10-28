@@ -1,0 +1,48 @@
+name: Check experimental multi-channel platform
+on:
+  push:
+    branches: ["codex/multi-channel-platform"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  domain:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          path: custom
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: mofeng-git/One-KVM
+          ref: b5d13ee16e099df4082e1da96a37db0888c57bb7
+          path: source
+          persist-credentials: false
+      - name: Check existing patches against exact upstream
+        run: python3 custom/scripts/prepare.py source
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+      - name: Test channel ownership, stable binding and authorization model
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --manifest-path custom/platform-core/Cargo.toml --locked 2>&1 | tee custom/out/platform-tests.txt
+      - name: Check existing ID, Key and config compatibility
+        run: python3 custom/scripts/test-config.py source custom/test-harness
+      - name: Collect domain source and development boundary
+        run: |
+          tar -C custom --exclude=target -czf custom/out/platform-core-source.tar.gz platform-core docs/architecture.md docs/upstream-maintenance.md docs/development-log.md LICENSE
+          cd custom/out
+          sha256sum platform-core-source.tar.gz platform-tests.txt > PLATFORM-SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: experimental-platform-evidence
+          path: |
+            custom/out/platform-core-source.tar.gz
+            custom/out/platform-tests.txt
+            custom/out/PLATFORM-SHA256SUMS
+            custom/out/provenance.json
+          retention-days: 30

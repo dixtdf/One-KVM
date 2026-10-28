@@ -43,6 +43,8 @@ jobs:
           rustup default 1.99.1
       - name: Test patched config and custom values
         run: python3 custom/scripts/test-config.py source custom/test-harness
+      - name: Test experimental channel domain model (not a runtime feature)
+        run: cargo test --manifest-path custom/platform-core/Cargo.toml --locked
       - name: Install cross
         run: cargo install cross --version 0.2.5 --locked
       - name: Build ARM64 using pinned Debian 12 image

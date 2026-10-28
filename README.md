@@ -1,5 +1,13 @@
 # One-KVM custom RustDesk ID and relay Key
 
+Experimental multi-channel development is on `codex/multi-channel-platform`.
+The domain model is not connected to the production runtime yet. See the
+[architecture and scope](docs/architecture.md),
+[upstream maintenance procedure](docs/upstream-maintenance.md), and
+[development log](docs/development-log.md). Existing ARM64 builds and deployed
+custom.2 remain single-channel until runtime isolation passes integration and
+hardware verification.
+
 This user-owned repository applies a patch to One-KVM 0.2.8 at commit
 b5d13ee16e099df4082e1da96a37db0888c57bb7 and builds an ARM64 Debian package.
 Device ID and relay authentication Key are editable and sent verbatim,
