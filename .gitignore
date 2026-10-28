@@ -2,3 +2,4 @@ out/
 test-harness/
 __pycache__/
 platform-core/target/
+platform-service/target/

@@ -32,9 +32,29 @@ jobs:
           cargo test --manifest-path custom/platform-core/Cargo.toml --locked 2>&1 | tee custom/out/platform-tests.txt
       - name: Check existing ID, Key and config compatibility
         run: python3 custom/scripts/test-config.py source custom/test-harness
+      - name: Resolve initial manager lockfile
+        shell: bash
+        run: |
+          if [ ! -f custom/platform-service/Cargo.lock ]; then
+            cargo generate-lockfile --manifest-path custom/platform-service/Cargo.toml
+          fi
+      - name: Test metadata manager authentication, persistence and channel API
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --manifest-path custom/platform-service/Cargo.toml --locked 2>&1 | tee custom/out/manager-tests.txt
+      - name: Preserve manager lock and test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: manager-lock-and-test-results
+          path: |
+            custom/platform-service/Cargo.lock
+            custom/out/manager-tests.txt
+          retention-days: 30
       - name: Collect domain source and development boundary
         run: |
-          tar -C custom --exclude=target -czf custom/out/platform-core-source.tar.gz platform-core docs/architecture.md docs/upstream-maintenance.md docs/development-log.md LICENSE
+          tar -C custom --exclude=target -czf custom/out/platform-core-source.tar.gz platform-core platform-service docs/architecture.md docs/upstream-maintenance.md docs/development-log.md LICENSE
           cd custom/out
           sha256sum platform-core-source.tar.gz platform-tests.txt > PLATFORM-SHA256SUMS
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
