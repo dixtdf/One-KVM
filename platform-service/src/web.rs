@@ -79,6 +79,8 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/channels/{id}/video/ice", post(video_ice))
         .route("/channels/{id}/video/close", post(video_close))
         .route("/channels/{id}/video/status", get(video_status))
+        .route("/channels/{id}/video/ice-servers", get(video_ice_servers))
+        .route("/channels/{id}/runtime/status", get(runtime_status))
         .route("/channels/{id}/control/acquire", post(control_acquire))
         .route("/channels/{id}/control/release", post(control_release))
         .route("/channels/{id}/control/input", post(control_input))
@@ -154,6 +156,15 @@ async fn video_close(State(s):State<Arc<Service>>,Extension(p):Extension<Princip
 async fn video_status(State(s):State<Arc<Service>>,Extension(p):Extension<Principal>,Path(id):Path<String>)->Result<Json<Value>> {
     let endpoint=authorized_video(&s,&p,&id).await?;
     Ok(Json(crate::gateway::video(endpoint,crate::gateway::VideoAction::Status,Value::Null).await.map_err(|_|Error(StatusCode::BAD_GATEWAY,"Worker status unavailable"))?))
+}
+async fn video_ice_servers(State(s):State<Arc<Service>>,Extension(p):Extension<Principal>,Path(id):Path<String>)->Result<Json<Value>> {
+    let endpoint=authorized_video(&s,&p,&id).await?;
+    Ok(Json(crate::gateway::video(endpoint,crate::gateway::VideoAction::IceServers,Value::Null).await.map_err(|_|Error(StatusCode::BAD_GATEWAY,"Worker ICE configuration unavailable"))?))
+}
+async fn runtime_status(State(s):State<Arc<Service>>,Extension(p):Extension<Principal>,Path(id):Path<String>)->Result<Json<Value>> {
+    let channel=store::channels(&s.pool).await.map_err(|_|bad("Invalid channel data"))?.into_iter().find(|c|c.id==id).ok_or_else(forbidden)?;
+    if !allowed(&s,&p,&channel,Permission::View).await?{return Err(forbidden());}
+    Ok(Json(json!({"runtime_configured":s.host.is_some(),"running":s.workers.lock().await.contains_key(&id)})))
 }
 
 impl Service {
