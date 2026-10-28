@@ -142,6 +142,42 @@ async fn management_shell_is_public_but_private_data_requires_authentication() {
 }
 
 #[tokio::test]
+async fn video_sessions_are_bound_to_channel_and_login_and_closed_after_revoke() {
+    use std::{net::TcpListener,io::{Read,Write}};
+    let f=fixture().await;let c=channel(&f,1).await;let id=c["id"].as_str().unwrap();
+    let (user,token)=viewer(&f).await;
+    let (_,login)=call(&f.app,"POST","/auth/login","",json!({"username":"viewer","password":"viewer-test-password"})).await;
+    let second_token=login["token"].as_str().unwrap();
+    let listener=TcpListener::bind("127.0.0.1:0").unwrap();let port=listener.local_addr().unwrap().port();
+    let server=std::thread::spawn(move || {
+        for index in 0..2 {
+            let (mut stream,_)=listener.accept().unwrap();stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut bytes=vec![];let mut byte=[0];
+            while !bytes.ends_with(b"\r\n\r\n") {stream.read_exact(&mut byte).unwrap();bytes.push(byte[0]);}
+            let head=String::from_utf8(bytes).unwrap();
+            assert!(head.contains("Cookie: one_kvm_session=worker-private"));
+            let len:usize=head.lines().find_map(|line|line.strip_prefix("Content-Length: ")).unwrap().trim().parse().unwrap();
+            let mut payload=vec![0;len];stream.read_exact(&mut payload).unwrap();let body:Value=serde_json::from_slice(&payload).unwrap();
+            let reply=if index==0 {assert!(!body.as_object().unwrap().contains_key("client_id"));json!({"session_id":"owned-session","sdp":"answer"})}
+                else {assert!(head.starts_with("POST /api/webrtc/close "));assert_eq!(body["session_id"],"owned-session");json!({"success":true})};
+            let reply=reply.to_string();write!(stream,"HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{}",reply.len(),reply).unwrap();
+        }
+    });
+    // Rebuild the router on the same database to attach the trusted test worker.
+    let service=Service::new(f.pool.clone());service.attach_worker(id.into(),one_kvm_platform_service::gateway::WorkerEndpoint{port,session:"worker-private".into()}).await;
+    let app=router(service.clone());
+    let path=format!("/channels/{id}/video/offer");
+    assert_eq!(call(&app,"POST",&path,&token,json!({"sdp":"offer"})).await.0,StatusCode::FORBIDDEN);
+    call(&app,"PUT",&format!("/grants/{user}/{id}"),&f.admin,json!({"role":"viewer"})).await;
+    let (status,reply)=call(&app,"POST",&path,&token,json!({"sdp":"offer","client_id":"someone-else"})).await;
+    assert_eq!(status,StatusCode::OK);assert_eq!(reply["session_id"],"owned-session");
+    assert_eq!(call(&app,"POST",&format!("/channels/{id}/video/close"),second_token,json!({"session_id":"owned-session"})).await.0,StatusCode::FORBIDDEN);
+    call(&app,"DELETE",&format!("/grants/{user}/{id}"),&f.admin,Value::Null).await;
+    service.sweep_video_sessions().await.unwrap();server.join().unwrap();
+    assert_eq!(call(&app,"POST",&format!("/channels/{id}/video/ice"),&token,json!({"session_id":"owned-session","candidate":{}})).await.0,StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn login_throttle_and_unknown_payloads_do_not_escalate_privileges() {
     let f=fixture().await;
     for _ in 0..5 {
