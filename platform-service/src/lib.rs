@@ -7,6 +7,7 @@ pub mod supervisor;
 pub mod worker_db;
 pub mod gateway;
 pub mod control;
+pub mod host;
 pub mod store;
 mod web;
 pub use web::{router, Service};

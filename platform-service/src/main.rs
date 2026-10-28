@@ -36,16 +36,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Legacy config imported; channel remains disabled; no listener started");
         return Ok(());
     }
-    if args.len() != 3 { return Err("Unknown arguments".into()); }
+    if args.len() != 3 && !(args.len()==6 && args[3]=="--worker") { return Err("Unknown arguments".into()); }
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE active=1 AND admin=1").fetch_one(&pool).await?;
     if count == 0 { return Err("Initialize an administrator with --bootstrap before serving".into()); }
     // No network exposure until gateway/runtime isolation is complete.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:18080").await?;
     println!("Experimental metadata manager listening on 127.0.0.1:18080");
-    let service=Service::new(pool);
+    let mut service=Service::new(pool);
+    if args.len()==6 {
+        Service::enable_runtime(&mut service,one_kvm_platform_service::host::Host::new(dir.join("workers"),PathBuf::from(&args[4]),args[5].clone())).map_err(io::Error::other)?;
+    }
     let monitor=service.clone();
     let sweep=tokio::spawn(async move {
-        loop {tokio::time::sleep(std::time::Duration::from_secs(2)).await;let _=monitor.sweep_controls().await;let _=monitor.sweep_video_sessions().await;}
+        loop {tokio::time::sleep(std::time::Duration::from_secs(2)).await;let _=monitor.reconcile_runtime().await;let _=monitor.sweep_controls().await;let _=monitor.sweep_video_sessions().await;}
     });
     axum::serve(listener, router(service)).with_graceful_shutdown(async {
         let _ = tokio::signal::ctrl_c().await;

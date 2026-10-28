@@ -14,6 +14,21 @@ pub struct Supervisor {
     recovery_required:BTreeSet<String>,
 }
 impl Supervisor {
+    pub fn can_prepare(&self,id:&str)->bool { !self.running.contains_key(id) && !self.recovery_required.contains(id) }
+    pub fn running_ids(&self)->Vec<String> {self.running.keys().cloned().collect()}
+    pub fn graceful_stop(&mut self,id:&str)->Result<(),String> {
+        let Some(worker)=self.running.get_mut(id) else{return Err("Worker is not running".into())};
+        if worker.child.try_wait().map_err(|_|"Cannot inspect worker")?.is_none(){
+            let status=Command::new("/bin/kill").args(["-TERM",&worker.child.id().to_string()]).status().map_err(|_|"Cannot signal worker")?;
+            if !status.success(){return Err("Worker stop signal failed".into());}
+        }
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(10);
+        while worker.child.try_wait().map_err(|_|"Cannot wait for worker")?.is_none(){
+            if std::time::Instant::now()>deadline{return Err("Worker stop is still pending".into());}
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        self.running.remove(id);self.recovery_required.insert(id.into());Ok(())
+    }
     pub fn new(executable:PathBuf,sha256:String,reservations:Arc<Reservations>)->Self {
         Self{executable,sha256,reservations,running:BTreeMap::new(),recovery_required:BTreeSet::new()}
     }

@@ -21,6 +21,7 @@ pub struct Service {
     workers:Mutex<BTreeMap<String,crate::gateway::WorkerEndpoint>>,
     video_sessions:Mutex<BTreeMap<String,VideoOwner>>,
     controls:Mutex<crate::control::Controls>,
+    host:Option<Arc<crate::host::Host>>,
 }
 struct VideoOwner { user:String, token_hash:String, channel:String, endpoint:crate::gateway::WorkerEndpoint }
 
@@ -35,12 +36,16 @@ impl Service {
             inventory,
             workers:Mutex::new(BTreeMap::new()),video_sessions:Mutex::new(BTreeMap::new()),
             controls:Mutex::new(crate::control::Controls::default()),
+            host:None,
             hashing_slots: Semaphore::new(4),
             dummy_hash: store::password_hash(&Uuid::new_v4().to_string()).expect("Hash initialization failed") })
     }
     /// Called only by the trusted supervisor after worker readiness/login.
     pub async fn attach_worker(&self,channel:String,endpoint:crate::gateway::WorkerEndpoint) {
         self.workers.lock().await.insert(channel,endpoint);
+    }
+    pub fn enable_runtime(service:&mut Arc<Self>,host:crate::host::Host)->std::result::Result<(),String>{
+        Arc::get_mut(service).ok_or("Runtime must be configured before serving")?.host=Some(Arc::new(host));Ok(())
     }
 }
 
@@ -77,6 +82,8 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/channels/{id}/control/acquire", post(control_acquire))
         .route("/channels/{id}/control/release", post(control_release))
         .route("/channels/{id}/control/input", post(control_input))
+        .route("/channels/{id}/runtime/start", post(runtime_start))
+        .route("/channels/{id}/runtime/stop", post(runtime_stop))
         .route_layer(middleware::from_fn_with_state(service.clone(), authenticate));
     Router::new()
         .route("/",get(|| async {Html(include_str!("../web/index.html"))}))
@@ -365,6 +372,7 @@ async fn create_channel(State(s): State<Arc<Service>>, Extension(p): Extension<P
 async fn update_channel(State(s): State<Arc<Service>>, Extension(p): Extension<Principal>, Path(id): Path<String>, Json(mut channel): Json<Channel>) -> Result<Json<Channel>> {
     // Resource reassignment remains a global administrator operation.
     admin(&p)?; let _guard = s.mutation.lock().await;
+    if s.workers.lock().await.contains_key(&id){return Err(bad("Stop the channel before changing its configuration"));}
     let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channels WHERE id=?").bind(&id).fetch_one(&s.pool).await?;
     if exists == 0 { return Err(Error(StatusCode::NOT_FOUND,"Channel not found")); }
     channel.id = id;validate(&s,&channel).await?;
@@ -375,9 +383,43 @@ async fn update_channel(State(s): State<Arc<Service>>, Extension(p): Extension<P
 }
 async fn delete_channel(State(s): State<Arc<Service>>, Extension(p): Extension<Principal>, Path(id): Path<String>) -> Result<Json<Value>> {
     admin(&p)?;let _guard = s.mutation.lock().await;let mut tx = s.pool.begin().await?;
+    if s.workers.lock().await.contains_key(&id){return Err(bad("Stop the channel before deleting it"));}
     sqlx::query("DELETE FROM channels WHERE id=?").bind(&id).execute(&mut *tx).await?;
     store::audit(&mut tx,&p.0.id,"delete_channel",&id).await?;tx.commit().await?;
     Ok(Json(json!({"ok":true})))
+}
+
+async fn runtime_start(State(s):State<Arc<Service>>,Extension(p):Extension<Principal>,Path(id):Path<String>)->Result<Json<Value>>{
+    admin(&p)?;let _guard=s.mutation.lock().await;
+    let host=s.host.as_ref().ok_or(Error(StatusCode::SERVICE_UNAVAILABLE,"Runtime is not configured"))?;
+    let channel=store::channels(&s.pool).await.map_err(|_|bad("Invalid channel data"))?.into_iter().find(|c|c.id==id).ok_or_else(forbidden)?;
+    let raw:Option<String>=sqlx::query_scalar("SELECT value FROM metadata WHERE key=?").bind(format!("worker_template:{id}")).fetch_optional(&s.pool).await?;
+    let template:Value=serde_json::from_str(&raw.ok_or_else(||bad("Channel has no private runtime template"))?).map_err(|_|bad("Invalid runtime template"))?;
+    let resources=store::resources(&s.pool).await.map_err(|_|bad("Invalid resource data"))?;
+    let endpoint=host.start(&channel,&resources,&s.inventory.read(),&template).await.map_err(|_|Error(StatusCode::SERVICE_UNAVAILABLE,"Worker start failed; inspect runtime recovery state"))?;
+    s.workers.lock().await.insert(id.clone(),endpoint);
+    let mut tx=s.pool.begin().await?;store::audit(&mut tx,&p.0.id,"start_channel",&id).await?;tx.commit().await?;
+    Ok(Json(json!({"running":true})))
+}
+async fn runtime_stop(State(s):State<Arc<Service>>,Extension(p):Extension<Principal>,Path(id):Path<String>)->Result<Json<Value>>{
+    admin(&p)?;let _guard=s.mutation.lock().await;
+    let host=s.host.as_ref().ok_or(Error(StatusCode::SERVICE_UNAVAILABLE,"Runtime is not configured"))?;
+    let mut controls=s.controls.lock().await;
+    let endpoint=s.workers.lock().await.get(&id).cloned().ok_or_else(||bad("Worker is offline or awaiting recovery"))?;
+    let channel=store::channels(&s.pool).await.map_err(|_|bad("Invalid channel data"))?.into_iter().find(|c|c.id==id).ok_or_else(forbidden)?;
+    host.stop(&id,endpoint,channel.control.is_some()).await.map_err(|_|Error(StatusCode::SERVICE_UNAVAILABLE,"Stop or confirmed input release is pending"))?;
+    s.workers.lock().await.remove(&id);controls.leases.remove(&id);
+    s.video_sessions.lock().await.retain(|_,owner|owner.channel!=id);
+    Ok(Json(json!({"running":false})))
+}
+impl Service {
+    pub async fn reconcile_runtime(&self)->std::result::Result<(),String>{
+        let Some(host)=&self.host else{return Ok(())};
+        let _=host.reconcile(&self.inventory.read()).await?;
+        let active=host.ids().await;
+        self.workers.lock().await.retain(|id,_|active.contains(id));
+        Ok(())
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
