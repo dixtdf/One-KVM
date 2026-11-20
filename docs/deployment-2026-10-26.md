@@ -167,3 +167,30 @@ Rollback and prior artifacts remain on the device at
 `one-kvm.fixed`, the DEB and `rollback.sh`). The browser can also fall back to
 the Software encoder without changing binaries. This record covers one
 deployment check, not long-term stability or the official CI artifact.
+
+## Official CI build and deployment, 2026-11-20
+
+Run [44694823069](https://github.com/dixtdf/One-KVM/actions/runs/44694823069)
+built branch `codex/v4l2m2m-yuv420p-fix` (commits `2abbf76`, `0e12e50`) and
+completed successfully end to end: prepare/patch, frontend type check and
+build, config tests, platform tests, cross ARM64 build with the pinned
+Debian 12 image, DEB packaging and artifact upload.
+
+- Artifact ZIP `one-kvm-custom-arm64`, SHA-256
+  `1814624841f65f1680e89e2841cef905025b0358f3bf205ab4451814880549b3`.
+- DEB `one-kvm_0.2.8+custom.3.platform.2_arm64.deb`, SHA-256
+  `40b32c37b6378703b4306ac7780fb94245a70d6bb8b2d4bbd0b3a0e1d5423dc5`.
+- Embedded official binary SHA-256
+  `f8c53455d12e747cd3bca33e0584eb90961c5171462b37cd753e61a557cf7343`.
+- The artifact provenance hashes match repository patches 0001-0009, so
+  patch 0009 is inside the official build.
+
+The DEB was installed over custom.2 on the Pi. Services stayed active, and the
+hardware encoder logged `switching input Nv12 -> Yuv420p` plus
+`Encoder h264_v4l2m2m needs YUV420P format`. A temporary loopback RTSP read of
+a hardware-encoded frame measured RGB (133.7, 143.8, 199.6), U std 28.6,
+V std 12.3, matching the source frame. RTSP was disabled again afterwards.
+
+The rollback path was exercised: `rollback.sh` restored custom.2 and its
+pre-upgrade database, the service remained active, and the fixed DEB binary was
+reinstalled. Assets remain in `/root/one-kvm-video-fix-20261120/`.
