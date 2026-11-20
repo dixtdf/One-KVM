@@ -118,3 +118,52 @@ frontend deployment, and served HTML matched the verified artifact. No productio
 password was changed. The service and C792 bridge are active; the USB gadget was
 reattached live on Unraid following service restart. Private backup, including the
 previous frontend drop-in, is /root/one-kvm-password-ui-20261026/ on the device.
+
+## Fix follow-up: 2026-11-20 bcm2835 chroma repair
+
+Patch `0009-v4l2m2m-yuv420p-input.patch` was added after the capture pipeline
+was proven correct (`/dev/video0` UYVY and the C792 NV12 bridge both decoded to
+source-matching pixels). The defect was inside the encoder: Pi 4B
+`h264_v4l2m2m` writes corrupt chroma when fed NV12 or NV21, so the picture was
+green/pink in the browser and in RTSP output.
+
+Measured on the device, decoding a hardware-encoded frame:
+
+| Input to `h264_v4l2m2m` | RGB mean | U mean/std |
+| --- | --- | --- |
+| NV12 (before) | (78.6, 196.3, 97.1) | 98.2 / 55.4 |
+| NV21 (before) | (100.3, 189.4, 71.1) | 83.9 / 93.1 |
+| YU12 (after) | (133.7, 143.8, 199.7) | 157.6 / 28.6 |
+| source reference | (133.7, 143.7, 199.5) | 157.6 / 28.6 |
+
+The same regression reproduced with `testsrc2` at 720p, 1080p and 1088p, so it
+is not a resolution or stride alignment issue. A byte-swapped NV21 probe was
+also wrong, ruling out a simple U/V plane swap. Software `libx264` always
+produced correct colours.
+
+Two pre-existing defects were also repaired while validating the CI path:
+patches 0005-0008 were stored with CRLF line endings, which makes
+`git apply` fail against the LF upstream checkout. All patches are now LF and
+`scripts/prepare.py` asserts there is no CR before it invokes `git apply`.
+Verified by cloning the pinned upstream commit and applying 0001-0009 in order:
+every patch applies, and the three `requires_planar_input` markers plus the
+custom RustDesk code are present.
+
+Deployment on the Pi used a native ARM64 build of the full patch set. Local
+verification needed a stub for the Rockchip-only C++ symbols and the pinned
+libyuv source because the device runs the stock Debian FFmpeg, which has no
+RKMPP headers; the official CI Docker build still compiles the real RKMPP path.
+The deployed binary is sha256
+`9e9c450ae19d4edf5fee647e426f259aa345e8ed5ec4a35aa685716ce48f0fe4`,
+version `0.2.8+custom.3.platform.2`; an ARM64 DEB whose payload matches this
+binary was built from the same tree (sha256
+`a2b46a3ea13aa72eeb23186f3dbec8b857b202c9f97e8424c83260fce23a861f`).
+Production RTSP output measured RGB (133.7, 143.8, 199.6) on hardware encoding
+after deployment, and custom ID/Key endpoints plus the frontend override were
+still intact.
+
+Rollback and prior artifacts remain on the device at
+`/root/one-kvm-video-fix-20261120/` (`one-kvm.before`, `one-kvm.before.db`,
+`one-kvm.fixed`, the DEB and `rollback.sh`). The browser can also fall back to
+the Software encoder without changing binaries. This record covers one
+deployment check, not long-term stability or the official CI artifact.

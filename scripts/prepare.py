@@ -10,6 +10,8 @@ head=subprocess.check_output(["git","rev-parse","HEAD"],cwd=src,text=True).strip
 assert head==pins["upstream"],head
 patch=root/"patches/0001-custom-rustdesk-id-key.patch"
 for item in sorted((root/"patches").glob("*.patch")):
+ # Git stores these with LF; a CRLF patch fails git apply inside CI.
+ assert b"\r\n" not in item.read_bytes(), item.name
  subprocess.run(["git","apply","--check",str(item)],cwd=src,check=True)
  subprocess.run(["git","apply",str(item)],cwd=src,check=True)
 change("Cargo.toml",'version = "0.2.8"','version = "'+pins["version"]+'"')
