@@ -263,3 +263,45 @@ a811d38通过Actions 40731384524及ARM64管理构建40731384437；产物12835416
 ZIP SHA256为`9d33da226b2692c1e8c20f238b2939d0a545f923f8398d9897c7b871d13205d1`。
 该产物正在下载，后续替换旁路实例复查浏览器；当前运行的旁路管理器仍为2a7e784。
 临时SSH转发只绑定本机18180，旁路管理器18080仍只绑定目标机回环地址。
+
+## 2026-11-20：bcm2835 V4L2 M2M NV12 色度损坏修复并实机部署
+
+现象：直连C792显示器正常，网页RGB画面绿屏/偏色。采集源 `/dev/video0` 与
+C792 bridge 输出的 `/dev/video42` NV12 单帧统计正常，说明问题在编码阶段。
+
+实测证据（Pi 4B, Debian 13, FFmpeg 7.1.5）：
+
+- `h264_v4l2m2m` 输入 NV12：解码帧 RGB 均值约 `(78.6, 196.3, 97.1)`，
+  U均值98.2、U标准差55.4，与源图 `(133.7, 143.7, 199.5)` 明显不符。
+- 同一编码器改喂 `yuv420p`（YU12）：RGB均值 `(133.7, 143.7, 199.5)`，
+  与源图逐项一致；软件 libx264 同样正确。
+- testsrc2 合成图在720p/1080p/1088p下都复现NV12损坏，排除分辨率对齐问题。
+- 把NV12字节交换为NV21仍不正确，排除简单的U/V平面反转解释。
+- 设备上 `bcm2835-codec` 仅提供 H.264 硬件编码，HEVC 只有解码，
+  故修复限定在 H.264 v4l2m2m。
+
+补丁 `0009-v4l2m2m-yuv420p-input.patch`：
+
+- `video/codec/mod.rs` 新增 `requires_planar_input`，仅当编码器名含
+  `v4l2m2m` 且 `/proc/device-tree/model` 为 Raspberry Pi 时返回真，
+  其它平台的 v4l2m2m 仍保留原有NV12零拷贝路径。
+- `video/codec/h264.rs` 在该条件下把编码器输入从 NV12/NV21 切换为
+  YUV420P，并记录切换日志。
+- `video/pipeline/encoder_state.rs` 令流水线在对应条件下执行
+  NV12→YUV420P 转换，避免直接把半平面NV12字节交给编码器。
+
+验证：`cargo check` 通过（仅有一个与本次改动无关的既有deprecated警告）。
+在本机临时以官方FFmpeg构建的ARM64 release二进制上，隔离数据目录与RTSP
+输出抓帧的像素统计与源帧一致；随后将包含补丁0001–0009的完整二进制部署到
+10.10.10.18，生产实例恢复硬件编码后实测RGB `(133.7, 143.8, 199.6)`、
+U 157.6、V 118.5，U/V标准差28.6/12.3，与源帧一致；日志显示
+`switching input Nv12 -> Yuv420p` 与 `Using NV12->YUV420P converter`。
+自定义ID/Key接口与前端override仍在部署后正常。
+
+部署与回退：备份在 `/root/one-kvm-video-fix-20261120/`，含上一版二进制、
+升级前数据库、已部署的修复二进制及 `rollback.sh`。网页仍可随时在设置中把
+编码器切换为 Software 作为不依赖二进制的兜底。
+
+注意：本机验证构建以桩替代Rockchip RKMPP C++符号并使用固定版本libyuv源码，
+因为 Pi 上官方FFmpeg不含RKMPP头；官方CI的Docker构建仍走完整RKMPP路径。
+该部署不能替代CI产物与长期稳定性观察。

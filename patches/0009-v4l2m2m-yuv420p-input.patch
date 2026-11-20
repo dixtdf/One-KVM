@@ -1,0 +1,81 @@
+diff --git a/src/video/codec/h264.rs b/src/video/codec/h264.rs
+index e66b8919..cab4009d 100644
+--- a/src/video/codec/h264.rs
++++ b/src/video/codec/h264.rs
+@@ -265,13 +265,27 @@ impl H264Encoder {
+     }
+ 
+     /// Create encoder with specific codec name
+-    pub fn with_codec(config: H264Config, codec_name: &str) -> Result<Self> {
++    pub fn with_codec(mut config: H264Config, codec_name: &str) -> Result<Self> {
+         init_hwcodec_logging();
+ 
+         let width = config.base.resolution.width;
+         let height = config.base.resolution.height;
+ 
+-        // Select pixel format based on config
++        // The Raspberry Pi bcm2835 H.264 encoder (h264_v4l2m2m) accepts
++        // NV12/NV21 buffers but emits corrupted chroma (green/pink picture).
++        // Only planar YU12 encodes correctly. Verified on Pi 4B at 720p,
++        // 1080p and 1088p; leave other v4l2m2m platforms untouched.
++        if crate::video::codec::requires_planar_input(codec_name)
++            && matches!(config.input_format, H264InputFormat::Nv12 | H264InputFormat::Nv21)
++        {
++            info!(
++                "bcm2835 v4l2m2m encoder: switching input {:?} -> {:?} to avoid corrupt chroma",
++                config.input_format,
++                H264InputFormat::Yuv420p
++            );
++            config.input_format = H264InputFormat::Yuv420p;
++        }
++
+         let (pixfmt_name, pixfmt_fallback) = match config.input_format {
+             H264InputFormat::Nv12 => ("nv12", AVPixelFormat::AV_PIX_FMT_NV12),
+             H264InputFormat::Nv21 => ("nv21", AVPixelFormat::AV_PIX_FMT_NV21),
+diff --git a/src/video/codec/mod.rs b/src/video/codec/mod.rs
+index cfa663a3..7093405b 100644
+--- a/src/video/codec/mod.rs
++++ b/src/video/codec/mod.rs
+@@ -38,6 +38,25 @@ pub use video_codec::{
+ pub use vp8::{VP8Config, VP8Encoder, VP8EncoderType, VP8InputFormat};
+ pub use vp9::{VP9Config, VP9Encoder, VP9EncoderType, VP9InputFormat};
+ 
++/// Whether the named encoder must be given planar YUV420P instead of a
++/// semi-planar NV12/NV21 buffer to produce correct colours.
++///
++/// The Raspberry Pi 4B bcm2835 `h264_v4l2m2m` encoder advertises NV12 and
++/// NV21 support but writes corrupted chroma for both. Planar YU12 is correct.
++/// The check is limited to Raspberry Pi device trees so other v4l2m2m
++/// platforms keep their existing zero-copy semi-planar path.
++pub(crate) fn requires_planar_input(codec_name: &str) -> bool {
++    if !codec_name.contains("v4l2m2m") {
++        return false;
++    }
++    static IS_RASPBERRY_PI: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *IS_RASPBERRY_PI.get_or_init(|| {
++        std::fs::read_to_string("/proc/device-tree/model")
++            .map(|model| model.contains("Raspberry Pi"))
++            .unwrap_or(false)
++    })
++}
++
+ pub(crate) fn select_codec_for_format<F>(
+     encoders: &[CodecInfo],
+     format: DataFormat,
+diff --git a/src/video/pipeline/encoder_state.rs b/src/video/pipeline/encoder_state.rs
+index 0f8eb075..897a8364 100644
+--- a/src/video/pipeline/encoder_state.rs
++++ b/src/video/pipeline/encoder_state.rs
+@@ -527,7 +527,11 @@ pub(super) fn build_encoder_state(
+     } else {
+         false
+     };
+-    let needs_yuv420p = if codec_name.contains("libx264") {
++    let needs_yuv420p = if crate::video::codec::requires_planar_input(&codec_name) {
++        // Raspberry Pi bcm2835 encoder emits corrupted chroma for semi-planar
++        // NV12/NV21; the pipeline must convert to planar YU12 before encoding.
++        true
++    } else if codec_name.contains("libx264") {
+         !matches!(
+             pipeline_input_format,
+             PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv21 | PixelFormat::Yuv420

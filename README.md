@@ -45,3 +45,17 @@ custom.2 handles the official client empty-Message key-exchange fallback by
 sending the normal password challenge once. It preserves password verification
 and never switches an established encrypted session to plaintext. A LocalAddr
 control connection to hbbs is no longer treated as a remote-desktop data stream.
+
+## Raspberry Pi hardware-encoder colour fix
+
+`0009-v4l2m2m-yuv420p-input.patch` fixes a green/pink picture produced by the
+Pi 4B bcm2835 `h264_v4l2m2m` encoder. The encoder advertises NV12/NV21 but
+writes corrupted chroma for those semi-planar inputs; only planar YU12 is
+correct. On Raspberry Pi device trees the H.264 encoder input and the pipeline
+conversion are forced to YUV420P, while other v4l2m2m platforms retain the
+existing NV12 path. See the
+[development log](docs/development-log.md) for measured before/after pixel
+statistics and the 2026-11-20 deployment record.
+
+If the fix has to be bypassed in the field, select the Software encoder in
+Settings; this needs no binary change and produces correct colours on this Pi.
