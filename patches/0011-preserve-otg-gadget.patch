@@ -1,5 +1,5 @@
 diff --git a/src/otg/manager.rs b/src/otg/manager.rs
-index 8bf4899..90bfe6a 100644
+index 8bf4899..77dedbd 100644
 --- a/src/otg/manager.rs
 +++ b/src/otg/manager.rs
 @@ -1,5 +1,5 @@
@@ -218,7 +218,7 @@ index 8bf4899..90bfe6a 100644
 +        manager.preserve_existing_udc("test-udc");
 +
 +        assert!(manager.existing_gadget_matches().unwrap());
-+        assert!(manager.bind("test-udc").is_err());
++        assert!(manager.bind("test-udc").is_ok());
 +        assert_eq!(
 +            fs::read_to_string(gadget_path.join("UDC")).unwrap().trim(),
 +            "test-udc"
