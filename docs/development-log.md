@@ -305,3 +305,22 @@ U 157.6、V 118.5，U/V标准差28.6/12.3，与源帧一致；日志显示
 注意：本机验证构建以桩替代Rockchip RKMPP C++符号并使用固定版本libyuv源码，
 因为 Pi 上官方FFmpeg不含RKMPP头；官方CI的Docker构建仍走完整RKMPP路径。
 该部署不能替代CI产物与长期稳定性观察。
+
+## 2026-11-21：移除 Web 登录边界并默认使用端口 80
+
+按用户要求增加补丁 `0010-remove-web-login-port-80.patch`，版本
+`0.2.8+custom.3.platform.3`。该补丁仅面向受信任局域网，不适用于公网部署。
+
+- 删除全部 Web `/api/auth/*` 路由和 `/api/config/auth`，移除 API 路由上的
+  `auth_middleware`。首次设置不再要求或创建 Web 用户名/密码，仍保留视频、HID、
+  扩展三步硬件配置。
+- 删除网页登录页、认证 store、TOTP 设置卡片及相应 API 调用。进入页面直接读取
+  控制台和设置。
+- Web UI、视频、HID、ATX、MSD、终端和配置接口均无 Web 身份边界。Redfish、
+  RTSP、VNC 的独立认证不回退；用户、会话、TOTP 内部数据模块保留但 Web 不再使用。
+- `WebConfig` 默认 HTTP 端口由 `8080` 改为 `80`。加载旧持久化配置时，仅将
+  精确的 `8080` 迁移为 `80` 并写回；显式配置的其他端口保持不变。
+- 增加后端测试：默认端口为 80、旧 8080 迁移、显式 9000 保持、SetupRequest
+  不要求账户字段。前端 `vue-tsc` 与 `vite build` 已通过（2777 modules）。
+- 本机没有 Rust 工具链，后端编译和 ARM64 DEB 仍以固定上游的 Actions 构建为准。
+  当前尚未把“前端构建通过”写成后端或实机验证成功。

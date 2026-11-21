@@ -1,0 +1,3280 @@
+diff --git a/src/auth/middleware.rs b/src/auth/middleware.rs
+deleted file mode 100644
+index ac32dc0..0000000
+--- a/src/auth/middleware.rs
++++ /dev/null
+@@ -1,104 +0,0 @@
+-use axum::{
+-    extract::{Request, State},
+-    http::StatusCode,
+-    middleware::Next,
+-    response::{IntoResponse, Response},
+-    Json,
+-};
+-use axum_extra::extract::CookieJar;
+-use std::sync::Arc;
+-
+-use crate::state::AppState;
+-use crate::web::ErrorResponse;
+-
+-pub const SESSION_COOKIE: &str = "one_kvm_session";
+-
+-pub fn extract_session_id(cookies: &CookieJar, headers: &axum::http::HeaderMap) -> Option<String> {
+-    if let Some(cookie) = cookies.get(SESSION_COOKIE) {
+-        return Some(cookie.value().to_string());
+-    }
+-
+-    if let Some(auth_header) = headers.get(axum::http::header::AUTHORIZATION) {
+-        if let Ok(auth_str) = auth_header.to_str() {
+-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
+-                return Some(token.to_string());
+-            }
+-        }
+-    }
+-
+-    None
+-}
+-
+-pub async fn auth_middleware(
+-    State(state): State<Arc<AppState>>,
+-    cookies: CookieJar,
+-    mut request: Request,
+-    next: Next,
+-) -> Result<Response, StatusCode> {
+-    let raw_path = request.uri().path();
+-    // Mounted under /api: inner path may lack prefix; normalize for whitelist checks.
+-    let path = raw_path.strip_prefix("/api").unwrap_or(raw_path);
+-
+-    if !state.config.is_initialized() {
+-        if is_setup_public_endpoint(path) {
+-            return Ok(next.run(request).await);
+-        }
+-    }
+-
+-    if is_public_endpoint(path) {
+-        return Ok(next.run(request).await);
+-    }
+-
+-    let session_id = extract_session_id(&cookies, request.headers());
+-
+-    if let Some(session_id) = session_id {
+-        if let Ok(Some(session)) = state.sessions.get(&session_id).await {
+-            request.extensions_mut().insert(session);
+-            return Ok(next.run(request).await);
+-        }
+-
+-        let message = if state.is_session_revoked(&session_id).await {
+-            "Logged in elsewhere"
+-        } else {
+-            "Session expired"
+-        };
+-        return Ok(unauthorized_response(message));
+-    }
+-
+-    Ok(unauthorized_response("Not authenticated"))
+-}
+-
+-fn unauthorized_response(message: &str) -> Response {
+-    let body = ErrorResponse {
+-        success: false,
+-        code: None,
+-        message: message.to_string(),
+-    };
+-    (StatusCode::UNAUTHORIZED, Json(body)).into_response()
+-}
+-
+-fn is_public_endpoint(path: &str) -> bool {
+-    matches!(
+-        path,
+-        "/" | "/auth/login" | "/auth/login/totp" | "/health" | "/setup" | "/setup/init"
+-    ) || path.starts_with("/assets/")
+-        || path.starts_with("/static/")
+-        || path.ends_with(".js")
+-        || path.ends_with(".css")
+-        || path.ends_with(".ico")
+-        || path.ends_with(".png")
+-        || path.ends_with(".svg")
+-}
+-
+-fn is_setup_public_endpoint(path: &str) -> bool {
+-    matches!(
+-        path,
+-        "/setup"
+-            | "/setup/init"
+-            | "/devices"
+-            | "/hid/bluetooth/adapters"
+-            | "/video/input-status"
+-            | "/stream/codecs"
+-            | "/video/codecs"
+-    )
+-}
+diff --git a/src/auth/mod.rs b/src/auth/mod.rs
+index 9caac93..04be694 100644
+--- a/src/auth/mod.rs
++++ b/src/auth/mod.rs
+@@ -1,10 +1,8 @@
+-pub mod middleware;
+ mod password;
+ mod session;
+ mod two_factor;
+ mod user;
+ 
+-pub use middleware::{auth_middleware, SESSION_COOKIE};
+ pub use password::{hash_password, verify_password};
+ pub use session::{Session, SessionStore};
+ pub use two_factor::{server_time_unix_ms, ChallengeInfo, EnrollmentInfo, TwoFactorService};
+diff --git a/src/config/schema/web.rs b/src/config/schema/web.rs
+index 83db924..9f04d88 100644
+--- a/src/config/schema/web.rs
++++ b/src/config/schema/web.rs
+@@ -146,7 +146,7 @@ pub struct WebConfig {
+ impl Default for WebConfig {
+     fn default() -> Self {
+         Self {
+-            http_port: 8080,
++            http_port: 80,
+             https_port: 8443,
+             bind_addresses: Vec::new(),
+             bind_address: "0.0.0.0".to_string(),
+@@ -170,4 +170,9 @@ mod tests {
+         assert!(MsdConfig::validate_inquiry_string("CD-ROM", "虚拟光驱").is_err());
+         assert!(MsdConfig::validate_inquiry_string("CD-ROM", "bad\tname").is_err());
+     }
++
++    #[test]
++    fn web_http_port_defaults_to_80() {
++        assert_eq!(WebConfig::default().http_port, 80);
++    }
+ }
+diff --git a/src/config/store.rs b/src/config/store.rs
+index b8324a0..3d372f3 100644
+--- a/src/config/store.rs
++++ b/src/config/store.rs
+@@ -27,9 +27,9 @@ impl ConfigStore {
+     }
+ 
+     pub async fn load(&self) -> Result<()> {
+-        let (mut config, removed_legacy_totp) = Self::load_config(&self.pool).await?;
++        let (mut config, needs_save) = Self::load_config(&self.pool).await?;
+         config.enforce_invariants();
+-        if removed_legacy_totp {
++        if needs_save {
+             Self::save_config_to_db(&self.pool, &config).await?;
+         }
+         self.cache.store(Arc::new(config));
+@@ -46,17 +46,23 @@ impl ConfigStore {
+             Some((json,)) => {
+                 let mut value: serde_json::Value =
+                     serde_json::from_str(&json).map_err(|e| AppError::Config(e.to_string()))?;
+-                let mut removed = false;
++                let mut needs_save = false;
+                 if let Some(auth) = value
+                     .get_mut("auth")
+                     .and_then(|value| value.as_object_mut())
+                 {
+-                    removed |= auth.remove("totp_enabled").is_some();
+-                    removed |= auth.remove("totp_secret").is_some();
++                    needs_save |= auth.remove("totp_enabled").is_some();
++                    needs_save |= auth.remove("totp_secret").is_some();
++                }
++                if let Some(web) = value.get_mut("web").and_then(|value| value.as_object_mut()) {
++                    if web.get("http_port").and_then(|port| port.as_u64()) == Some(8080) {
++                        web.insert("http_port".to_string(), serde_json::json!(80));
++                        needs_save = true;
++                    }
+                 }
+                 let config =
+                     serde_json::from_value(value).map_err(|e| AppError::Config(e.to_string()))?;
+-                Ok((config, removed))
++                Ok((config, needs_save))
+             }
+             None => {
+                 let config = AppConfig::default();
+@@ -225,4 +231,51 @@ mod tests {
+         assert!(!persisted.contains("totp_enabled"));
+         assert!(!persisted.contains("totp_secret"));
+     }
++
++    #[tokio::test]
++    async fn load_migrates_legacy_http_port_8080_to_80() {
++        let dir = tempdir().unwrap();
++        let db = DatabasePool::new(&dir.path().join("test.db"))
++            .await
++            .unwrap();
++        db.init_schema().await.unwrap();
++        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
++        value["web"]["http_port"] = serde_json::json!(8080);
++        sqlx::query("INSERT INTO config (key, value) VALUES ('app_config', ?1)")
++            .bind(value.to_string())
++            .execute(db.pool())
++            .await
++            .unwrap();
++
++        let store = ConfigStore::new(db.clone_pool());
++        store.load().await.unwrap();
++        assert_eq!(store.get().web.http_port, 80);
++        let (persisted,): (String,) =
++            sqlx::query_as("SELECT value FROM config WHERE key = 'app_config'")
++                .fetch_one(db.pool())
++                .await
++                .unwrap();
++        let persisted: serde_json::Value = serde_json::from_str(&persisted).unwrap();
++        assert_eq!(persisted["web"]["http_port"], 80);
++    }
++
++    #[tokio::test]
++    async fn load_preserves_explicit_non_default_http_port() {
++        let dir = tempdir().unwrap();
++        let db = DatabasePool::new(&dir.path().join("test.db"))
++            .await
++            .unwrap();
++        db.init_schema().await.unwrap();
++        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
++        value["web"]["http_port"] = serde_json::json!(9000);
++        sqlx::query("INSERT INTO config (key, value) VALUES ('app_config', ?1)")
++            .bind(value.to_string())
++            .execute(db.pool())
++            .await
++            .unwrap();
++
++        let store = ConfigStore::new(db.clone_pool());
++        store.load().await.unwrap();
++        assert_eq!(store.get().web.http_port, 9000);
++    }
+ }
+diff --git a/src/web/handlers/account.rs b/src/web/handlers/account.rs
+deleted file mode 100644
+index a86e9bc..0000000
+--- a/src/web/handlers/account.rs
++++ /dev/null
+@@ -1,248 +0,0 @@
+-use super::*;
+-use crate::auth::server_time_unix_ms;
+-use crate::state::ShutdownAction;
+-
+-/// Change password request
+-#[derive(Deserialize)]
+-pub struct ChangePasswordRequest {
+-    pub current_password: String,
+-    pub new_password: String,
+-}
+-
+-#[derive(Serialize)]
+-pub struct TotpStatusResponse {
+-    pub enabled: bool,
+-    pub server_time_unix_ms: u64,
+-}
+-
+-#[derive(Deserialize)]
+-pub struct BeginTotpEnrollmentRequest {
+-    pub current_password: String,
+-}
+-
+-#[derive(Serialize)]
+-pub struct TotpEnrollmentResponse {
+-    pub enrollment_id: String,
+-    pub secret: String,
+-    pub otpauth_uri: String,
+-    pub expires_at_unix_ms: u64,
+-    pub server_time_unix_ms: u64,
+-}
+-
+-#[derive(Deserialize)]
+-pub struct ConfirmTotpEnrollmentRequest {
+-    pub enrollment_id: String,
+-    pub code: String,
+-}
+-
+-#[derive(Deserialize)]
+-pub struct DisableTotpRequest {
+-    pub current_password: String,
+-    pub code: String,
+-}
+-
+-pub async fn totp_status(
+-    State(state): State<Arc<AppState>>,
+-    axum::Extension(session): axum::Extension<Session>,
+-) -> Result<Json<TotpStatusResponse>> {
+-    Ok(Json(TotpStatusResponse {
+-        enabled: state.two_factor.is_enabled(&session.user_id).await?,
+-        server_time_unix_ms: server_time_unix_ms(),
+-    }))
+-}
+-
+-pub async fn begin_totp_enrollment(
+-    State(state): State<Arc<AppState>>,
+-    axum::Extension(session): axum::Extension<Session>,
+-    Json(req): Json<BeginTotpEnrollmentRequest>,
+-) -> Result<Json<TotpEnrollmentResponse>> {
+-    let user = authenticated_user(&state, &session).await?;
+-    verify_current_password(&state, &user, &req.current_password).await?;
+-    let enrollment = state
+-        .two_factor
+-        .begin_enrollment(&session.id, &user.id, &user.username)
+-        .await?;
+-    Ok(Json(TotpEnrollmentResponse {
+-        enrollment_id: enrollment.id,
+-        secret: enrollment.secret,
+-        otpauth_uri: enrollment.otpauth_uri,
+-        expires_at_unix_ms: enrollment.expires_at_unix_ms,
+-        server_time_unix_ms: server_time_unix_ms(),
+-    }))
+-}
+-
+-pub async fn confirm_totp_enrollment(
+-    State(state): State<Arc<AppState>>,
+-    axum::Extension(session): axum::Extension<Session>,
+-    Json(req): Json<ConfirmTotpEnrollmentRequest>,
+-) -> Result<Json<LoginResponse>> {
+-    authenticated_user(&state, &session).await?;
+-    state
+-        .two_factor
+-        .confirm_enrollment(&session.id, &session.user_id, &req.enrollment_id, &req.code)
+-        .await?;
+-    revoke_other_sessions(&state, &session.id).await?;
+-    Ok(Json(LoginResponse {
+-        success: true,
+-        message: None,
+-    }))
+-}
+-
+-pub async fn disable_totp(
+-    State(state): State<Arc<AppState>>,
+-    axum::Extension(session): axum::Extension<Session>,
+-    Json(req): Json<DisableTotpRequest>,
+-) -> Result<Json<LoginResponse>> {
+-    let user = authenticated_user(&state, &session).await?;
+-    verify_current_password(&state, &user, &req.current_password).await?;
+-    state.two_factor.disable(&user.id, &req.code).await?;
+-    revoke_other_sessions(&state, &session.id).await?;
+-    Ok(Json(LoginResponse {
+-        success: true,
+-        message: None,
+-    }))
+-}
+-
+-async fn authenticated_user(state: &Arc<AppState>, session: &Session) -> Result<crate::auth::User> {
+-    state
+-        .users
+-        .single_user()
+-        .await?
+-        .filter(|user| user.id == session.user_id)
+-        .ok_or_else(|| AppError::AuthError("Invalid session".to_string()))
+-}
+-
+-async fn verify_current_password(
+-    state: &Arc<AppState>,
+-    user: &crate::auth::User,
+-    password: &str,
+-) -> Result<()> {
+-    if state
+-        .users
+-        .verify(&user.username, password)
+-        .await?
+-        .is_none()
+-    {
+-        return Err(AppError::AuthError(
+-            "Current password is incorrect".to_string(),
+-        ));
+-    }
+-    Ok(())
+-}
+-
+-async fn revoke_other_sessions(state: &Arc<AppState>, current_session_id: &str) -> Result<()> {
+-    let revoked = state.sessions.delete_all_except(current_session_id).await?;
+-    state.remember_revoked_sessions(revoked).await;
+-    Ok(())
+-}
+-
+-/// Change current user's password
+-pub async fn change_password(
+-    State(state): State<Arc<AppState>>,
+-    axum::Extension(session): axum::Extension<Session>,
+-    Json(req): Json<ChangePasswordRequest>,
+-) -> Result<Json<LoginResponse>> {
+-    let current_user = state
+-        .users
+-        .single_user()
+-        .await?
+-        .ok_or_else(|| AppError::AuthError("User not found".to_string()))?;
+-
+-    if current_user.id != session.user_id {
+-        return Err(AppError::AuthError("Invalid session".to_string()));
+-    }
+-
+-    if req.new_password.len() < 4 {
+-        return Err(AppError::BadRequest(
+-            "Password must be at least 4 characters".to_string(),
+-        ));
+-    }
+-
+-    let verified = state
+-        .users
+-        .verify(&current_user.username, &req.current_password)
+-        .await?;
+-    if verified.is_none() {
+-        return Err(AppError::AuthError(
+-            "Current password is incorrect".to_string(),
+-        ));
+-    }
+-
+-    state
+-        .users
+-        .update_password(&session.user_id, &req.new_password)
+-        .await?;
+-    info!("Password changed for user ID: {}", session.user_id);
+-
+-    Ok(Json(LoginResponse {
+-        success: true,
+-        message: Some("Password changed successfully".to_string()),
+-    }))
+-}
+-
+-/// Change username request
+-#[derive(Deserialize)]
+-pub struct ChangeUsernameRequest {
+-    pub username: String,
+-    pub current_password: String,
+-}
+-
+-/// Change current user's username
+-pub async fn change_username(
+-    State(state): State<Arc<AppState>>,
+-    axum::Extension(session): axum::Extension<Session>,
+-    Json(req): Json<ChangeUsernameRequest>,
+-) -> Result<Json<LoginResponse>> {
+-    let current_user = state
+-        .users
+-        .single_user()
+-        .await?
+-        .ok_or_else(|| AppError::AuthError("User not found".to_string()))?;
+-
+-    if current_user.id != session.user_id {
+-        return Err(AppError::AuthError("Invalid session".to_string()));
+-    }
+-
+-    if req.username.len() < 2 {
+-        return Err(AppError::BadRequest(
+-            "Username must be at least 2 characters".to_string(),
+-        ));
+-    }
+-
+-    let verified = state
+-        .users
+-        .verify(&current_user.username, &req.current_password)
+-        .await?;
+-    if verified.is_none() {
+-        return Err(AppError::AuthError(
+-            "Current password is incorrect".to_string(),
+-        ));
+-    }
+-
+-    if current_user.username != req.username {
+-        state
+-            .users
+-            .update_username(&session.user_id, &req.username)
+-            .await?;
+-    }
+-    info!("Username changed for user ID: {}", session.user_id);
+-
+-    Ok(Json(LoginResponse {
+-        success: true,
+-        message: Some("Username changed successfully".to_string()),
+-    }))
+-}
+-
+-/// Restart the application
+-pub async fn system_restart(State(state): State<Arc<AppState>>) -> Json<LoginResponse> {
+-    info!("System restart requested via API");
+-
+-    let _ = state
+-        .shutdown_tx
+-        .send(ShutdownAction::Restart { exe_path: None });
+-
+-    Json(LoginResponse {
+-        success: true,
+-        message: Some("Restarting...".to_string()),
+-    })
+-}
+diff --git a/src/web/handlers/auth.rs b/src/web/handlers/auth.rs
+deleted file mode 100644
+index 0d088d1..0000000
+--- a/src/web/handlers/auth.rs
++++ /dev/null
+@@ -1,151 +0,0 @@
+-use super::*;
+-
+-#[derive(Deserialize)]
+-pub struct LoginRequest {
+-    pub username: String,
+-    pub password: String,
+-}
+-
+-#[derive(Serialize)]
+-pub struct LoginResponse {
+-    pub success: bool,
+-    pub message: Option<String>,
+-}
+-
+-#[derive(Serialize)]
+-pub struct AuthLoginResponse {
+-    pub next: &'static str,
+-    #[serde(skip_serializing_if = "Option::is_none")]
+-    pub challenge_id: Option<String>,
+-    #[serde(skip_serializing_if = "Option::is_none")]
+-    pub expires_at_unix_ms: Option<u64>,
+-}
+-
+-#[derive(Deserialize)]
+-pub struct TotpLoginRequest {
+-    pub challenge_id: String,
+-    pub code: String,
+-}
+-
+-pub async fn login(
+-    State(state): State<Arc<AppState>>,
+-    cookies: CookieJar,
+-    Json(req): Json<LoginRequest>,
+-) -> Result<(CookieJar, Json<AuthLoginResponse>)> {
+-    let config = state.config.get();
+-
+-    // Check if system is initialized
+-    if !config.initialized {
+-        return Err(AppError::BadRequest("System not initialized".to_string()));
+-    }
+-
+-    // Verify user credentials
+-    let user = state
+-        .users
+-        .verify(&req.username, &req.password)
+-        .await?
+-        .ok_or_else(|| AppError::AuthError("Invalid username or password".to_string()))?;
+-
+-    if let Some(challenge) = state.two_factor.begin_login(&user.id).await? {
+-        return Ok((
+-            cookies,
+-            Json(AuthLoginResponse {
+-                next: "totp",
+-                challenge_id: Some(challenge.id),
+-                expires_at_unix_ms: Some(challenge.expires_at_unix_ms),
+-            }),
+-        ));
+-    }
+-
+-    create_authenticated_session(&state, cookies, &user.id).await
+-}
+-
+-pub async fn login_totp(
+-    State(state): State<Arc<AppState>>,
+-    cookies: CookieJar,
+-    Json(req): Json<TotpLoginRequest>,
+-) -> Result<(CookieJar, Json<AuthLoginResponse>)> {
+-    let user_id = state
+-        .two_factor
+-        .complete_login(&req.challenge_id, &req.code)
+-        .await?;
+-    create_authenticated_session(&state, cookies, &user_id).await
+-}
+-
+-async fn create_authenticated_session(
+-    state: &Arc<AppState>,
+-    cookies: CookieJar,
+-    user_id: &str,
+-) -> Result<(CookieJar, Json<AuthLoginResponse>)> {
+-    let config = state.config.get();
+-    let (session, revoked_ids) = state
+-        .sessions
+-        .create_for_login(user_id, config.auth.single_user_allow_multiple_sessions)
+-        .await?;
+-    state.remember_revoked_sessions(revoked_ids).await;
+-
+-    // Set session cookie
+-    let cookie = Cookie::build((SESSION_COOKIE, session.id))
+-        .path("/")
+-        .http_only(true)
+-        .same_site(SameSite::Lax)
+-        .max_age(time::Duration::seconds(
+-            config.auth.session_timeout_secs as i64,
+-        ))
+-        .build();
+-
+-    Ok((
+-        cookies.add(cookie),
+-        Json(AuthLoginResponse {
+-            next: "authenticated",
+-            challenge_id: None,
+-            expires_at_unix_ms: None,
+-        }),
+-    ))
+-}
+-
+-pub async fn logout(
+-    State(state): State<Arc<AppState>>,
+-    cookies: CookieJar,
+-) -> Result<(CookieJar, Json<LoginResponse>)> {
+-    // Get session ID from cookie
+-    if let Some(cookie) = cookies.get(SESSION_COOKIE) {
+-        state.sessions.delete(cookie.value()).await?;
+-    }
+-
+-    // Remove cookie
+-    let cookie = Cookie::build((SESSION_COOKIE, ""))
+-        .path("/")
+-        .max_age(time::Duration::ZERO)
+-        .build();
+-
+-    Ok((
+-        cookies.remove(cookie),
+-        Json(LoginResponse {
+-            success: true,
+-            message: Some("Logged out".to_string()),
+-        }),
+-    ))
+-}
+-
+-#[derive(Serialize)]
+-pub struct AuthCheckResponse {
+-    pub authenticated: bool,
+-    pub user: Option<String>,
+-}
+-
+-pub async fn auth_check(
+-    State(state): State<Arc<AppState>>,
+-    axum::Extension(session): axum::Extension<Session>,
+-) -> Json<AuthCheckResponse> {
+-    // Get user info from user_id
+-    let username = match state.users.single_user().await {
+-        Ok(Some(user)) if user.id == session.user_id => Some(user.username),
+-        _ => None,
+-    };
+-
+-    Json(AuthCheckResponse {
+-        authenticated: true,
+-        user: username,
+-    })
+-}
+diff --git a/src/web/handlers/config/auth.rs b/src/web/handlers/config/auth.rs
+deleted file mode 100644
+index 5e35830..0000000
+--- a/src/web/handlers/config/auth.rs
++++ /dev/null
+@@ -1,27 +0,0 @@
+-use axum::{extract::State, Json};
+-use std::sync::Arc;
+-
+-use crate::config::AuthConfig;
+-use crate::error::Result;
+-use crate::state::AppState;
+-
+-use super::types::AuthConfigUpdate;
+-
+-pub async fn get_auth_config(State(state): State<Arc<AppState>>) -> Json<AuthConfig> {
+-    Json(state.config.get().auth.clone())
+-}
+-
+-pub async fn update_auth_config(
+-    State(state): State<Arc<AppState>>,
+-    Json(update): Json<AuthConfigUpdate>,
+-) -> Result<Json<AuthConfig>> {
+-    update.validate()?;
+-    state
+-        .config
+-        .update(|config| {
+-            update.apply_to(&mut config.auth);
+-        })
+-        .await?;
+-
+-    Ok(Json(state.config.get().auth.clone()))
+-}
+diff --git a/src/web/handlers/config/mod.rs b/src/web/handlers/config/mod.rs
+index 8dbfbcf..4d2f779 100644
+--- a/src/web/handlers/config/mod.rs
++++ b/src/web/handlers/config/mod.rs
+@@ -3,7 +3,6 @@ mod types;
+ 
+ mod atx;
+ mod audio;
+-mod auth;
+ mod hid;
+ #[cfg(unix)]
+ mod msd;
+@@ -25,7 +24,6 @@ mod web;
+ 
+ pub use atx::{get_atx_config, update_atx_config};
+ pub use audio::{get_audio_config, update_audio_config};
+-pub use auth::{get_auth_config, update_auth_config};
+ pub use hid::{get_hid_config, update_hid_config};
+ #[cfg(unix)]
+ pub use msd::{get_msd_config, update_msd_config};
+diff --git a/src/web/handlers/config/types.rs b/src/web/handlers/config/types.rs
+index b6eaa58..d98d4e2 100644
+--- a/src/web/handlers/config/types.rs
++++ b/src/web/handlers/config/types.rs
+@@ -23,24 +23,6 @@ pub struct WatchdogConfigResponse {
+     pub reason: Option<String>,
+ }
+ 
+-#[typeshare]
+-#[derive(Debug, Deserialize)]
+-pub struct AuthConfigUpdate {
+-    pub single_user_allow_multiple_sessions: Option<bool>,
+-}
+-
+-impl AuthConfigUpdate {
+-    pub fn validate(&self) -> crate::error::Result<()> {
+-        Ok(())
+-    }
+-
+-    pub fn apply_to(&self, config: &mut AuthConfig) {
+-        if let Some(allow_multiple) = self.single_user_allow_multiple_sessions {
+-            config.single_user_allow_multiple_sessions = allow_multiple;
+-        }
+-    }
+-}
+-
+ #[typeshare]
+ #[derive(Debug, Deserialize)]
+ pub struct VideoConfigUpdate {
+diff --git a/src/web/handlers/mod.rs b/src/web/handlers/mod.rs
+index 4fd088f..1d69109 100644
+--- a/src/web/handlers/mod.rs
++++ b/src/web/handlers/mod.rs
+@@ -3,10 +3,8 @@ pub mod devices;
+ pub mod extensions;
+ pub mod terminal;
+ 
+-mod account;
+ mod atx_api;
+ mod audio_api;
+-mod auth;
+ mod computer_use;
+ mod hid_api;
+ mod inventory;
+@@ -18,10 +16,8 @@ mod system;
+ mod update_api;
+ mod webrtc;
+ 
+-pub use account::*;
+ pub use atx_api::*;
+ pub use audio_api::*;
+-pub use auth::*;
+ pub use computer_use::*;
+ pub use hid_api::*;
+ pub use inventory::*;
+@@ -37,12 +33,10 @@ use axum::{
+     extract::{Query, State},
+     Json,
+ };
+-use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
+ use serde::{Deserialize, Serialize};
+ use std::sync::Arc;
+ use tracing::{debug, info, warn};
+ 
+-use crate::auth::{Session, SESSION_COOKIE};
+ use crate::config::StreamMode;
+ use crate::diagnostics::{get_device_info, get_disk_space, DeviceInfo, DiskSpaceInfo};
+ use crate::error::{AppError, Result};
+@@ -56,3 +50,10 @@ use crate::video::codec::{
+     VideoEncoderSelfCheckResponse,
+ };
+ use crate::video::codec_constraints::codec_to_id;
++
++/// Generic operation response used by control endpoints and setup.
++#[derive(Serialize)]
++pub struct LoginResponse {
++    pub success: bool,
++    pub message: Option<String>,
++}
+diff --git a/src/web/handlers/setup.rs b/src/web/handlers/setup.rs
+index 5855ded..fe72d4e 100644
+--- a/src/web/handlers/setup.rs
++++ b/src/web/handlers/setup.rs
+@@ -18,9 +18,6 @@ pub async fn setup_status(State(state): State<Arc<AppState>>) -> Json<SetupStatu
+ 
+ #[derive(Deserialize)]
+ pub struct SetupRequest {
+-    // Account settings
+-    pub username: String,
+-    pub password: String,
+     // Video settings
+     pub video_device: Option<String>,
+     pub video_format: Option<String>,
+@@ -84,20 +81,6 @@ pub async fn setup_init(
+         return Err(AppError::BadRequest("Already initialized".to_string()));
+     }
+ 
+-    // Validate username
+-    if req.username.len() < 2 {
+-        return Err(AppError::BadRequest(
+-            "Username must be at least 2 characters".to_string(),
+-        ));
+-    }
+-
+-    // Validate password
+-    if req.password.len() < 4 {
+-        return Err(AppError::BadRequest(
+-            "Password must be at least 4 characters".to_string(),
+-        ));
+-    }
+-
+     if let Some(path) = req.video_device.as_deref() {
+         let source_following = state
+             .stream_manager
+@@ -130,15 +113,9 @@ pub async fn setup_init(
+     }
+ 
+     let old_config = state.config.get();
+-    // Validate the selected HID configuration before creating the one-time account.
++    // Validate the selected HID configuration before persisting setup.
+     let hid_config = req.hid_config(&old_config.hid)?;
+ 
+-    // Create single system user
+-    state
+-        .users
+-        .create_first_user(&req.username, &req.password)
+-        .await?;
+-
+     // Update config
+     state
+         .config
+@@ -284,12 +261,16 @@ mod tests {
+     use crate::config::{AppConfig, HidBackend, HidConfig, OtgHidProfile};
+     use serde_json::{json, Value};
+ 
+-    fn request(mut hid: Value) -> SetupRequest {
+-        hid["username"] = json!("admin");
+-        hid["password"] = json!("test-password");
++    fn request(hid: Value) -> SetupRequest {
+         serde_json::from_value(hid).unwrap()
+     }
+ 
++    #[test]
++    fn setup_request_does_not_require_web_account_fields() {
++        let req: SetupRequest = serde_json::from_value(json!({ "hid_backend": "otg" })).unwrap();
++        assert_eq!(req.hid_backend, Some(HidBackend::Otg));
++    }
++
+     #[test]
+     fn setup_applies_selected_otg_device_and_legacy_options() {
+         let req = request(json!({
+@@ -360,7 +341,6 @@ mod tests {
+     #[test]
+     fn setup_rejects_unknown_backend_instead_of_disabling_hid() {
+         assert!(serde_json::from_value::<SetupRequest>(json!({
+-            "username": "admin", "password": "test-password",
+             "hid_backend": "unsupported"
+         }))
+         .is_err());
+diff --git a/src/web/handlers/system.rs b/src/web/handlers/system.rs
+index 36f22c7..66e1c61 100644
+--- a/src/web/handlers/system.rs
++++ b/src/web/handlers/system.rs
+@@ -1,4 +1,5 @@
+ use super::*;
++use crate::state::ShutdownAction;
+ 
+ /// Health check response
+ #[derive(Serialize)]
+@@ -112,3 +113,17 @@ pub async fn system_info(State(state): State<Arc<AppState>>) -> Json<SystemInfo>
+         device_info,
+     })
+ }
++
++/// Restart the application.
++pub async fn system_restart(State(state): State<Arc<AppState>>) -> Json<LoginResponse> {
++    info!("System restart requested via API");
++
++    let _ = state
++        .shutdown_tx
++        .send(ShutdownAction::Restart { exe_path: None });
++
++    Json(LoginResponse {
++        success: true,
++        message: Some("Restarting...".to_string()),
++    })
++}
+diff --git a/src/web/routes.rs b/src/web/routes.rs
+index e48b45f..4e781ca 100644
+--- a/src/web/routes.rs
++++ b/src/web/routes.rs
+@@ -5,7 +5,6 @@ use axum::{
+ };
+ use axum::{
+     http::StatusCode,
+-    middleware,
+     response::IntoResponse,
+     routing::{any, get, patch, post},
+     Json, Router,
+@@ -21,7 +20,6 @@ use super::handlers;
+ #[cfg(unix)]
+ use super::uac_ws::uac_audio_ws_handler;
+ use super::ws::ws_handler;
+-use crate::auth::auth_middleware;
+ use crate::hid::websocket::ws_hid_handler;
+ use crate::state::AppState;
+ 
+@@ -40,32 +38,15 @@ pub fn create_router(state: Arc<AppState>) -> Router {
+         .allow_methods(Any)
+         .allow_headers(Any);
+ 
+-    // Public routes (no auth required)
+-    // Note: /info moved to user_routes for security (contains hostname, IPs, etc.)
++    // Public setup endpoints; all control routes are unauthenticated by the custom build.
+     let public_routes = Router::new()
+         .route("/health", get(handlers::health_check))
+-        .route("/auth/login", post(handlers::login))
+-        .route("/auth/login/totp", post(handlers::login_totp))
+         .route("/setup", get(handlers::setup_status))
+         .route("/setup/init", post(handlers::setup_init));
+ 
+-    // Authenticated routes (all logged-in users)
++    // Control routes (unauthenticated in the custom build)
+     let user_routes = Router::new()
+         .route("/info", get(handlers::system_info))
+-        .route("/auth/logout", post(handlers::logout))
+-        .route("/auth/check", get(handlers::auth_check))
+-        .route("/auth/password", post(handlers::change_password))
+-        .route("/auth/username", post(handlers::change_username))
+-        .route("/auth/totp", get(handlers::totp_status))
+-        .route(
+-            "/auth/totp/enrollment",
+-            post(handlers::begin_totp_enrollment),
+-        )
+-        .route(
+-            "/auth/totp/enrollment/confirm",
+-            post(handlers::confirm_totp_enrollment),
+-        )
+-        .route("/auth/totp/disable", post(handlers::disable_totp))
+         .route("/devices", get(handlers::list_devices))
+         .route("/video/input-status", get(handlers::video_input_status))
+         // WebSocket endpoint for real-time events
+@@ -219,9 +200,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
+             post(handlers::computer_use_stop),
+         )
+         .route("/ws/computer-use", any(handlers::computer_use_ws))
+-        // Auth configuration
+-        .route("/config/auth", get(handlers::config::get_auth_config))
+-        .route("/config/auth", patch(handlers::config::update_auth_config))
+         // Redfish configuration
+         .route("/config/redfish", get(handlers::config::get_redfish_config))
+         .route(
+@@ -340,10 +318,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
+             )
+     };
+ 
+-    // Protected routes (all authenticated users)
++    // Unix control routes
+     let protected_routes = user_routes;
+ 
+-    // Stream endpoints (accessible with auth, but typically embedded in pages)
++    // Stream endpoints
+     let stream_routes = Router::new()
+         .route("/stream", get(handlers::mjpeg_stream))
+         .route("/stream/mjpeg", get(handlers::mjpeg_stream))
+@@ -366,11 +344,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
+         .merge(protected_routes)
+         .merge(stream_routes)
+         .merge(upload_routes)
+-        .fallback(api_not_found)
+-        .layer(middleware::from_fn_with_state(
+-            state.clone(),
+-            auth_middleware,
+-        ));
++        .fallback(api_not_found);
+ 
+     // Static file serving
+     let static_routes = super::static_files::static_file_router();
+diff --git a/web/src/App.vue b/web/src/App.vue
+index 220b0df..0be9e4f 100644
+--- a/web/src/App.vue
++++ b/web/src/App.vue
+@@ -4,7 +4,7 @@ import '@/sonner-overrides.css'
+ import { computed, KeepAlive, onMounted } from 'vue'
+ import { useI18n } from 'vue-i18n'
+ import { RouterView, useRouter } from 'vue-router'
+-import { useAuthStore } from '@/stores/auth'
++import { useSetupStore } from '@/stores/setup'
+ import { useSystemStore } from '@/stores/system'
+ import { Toaster } from '@/components/ui/sonner'
+ import { useTheme } from '@/composables/useTheme'
+@@ -21,13 +21,13 @@ const toasterToastOptions = computed(() => ({
+ }))
+ 
+ const router = useRouter()
+-const authStore = useAuthStore()
++const setupStore = useSetupStore()
+ const systemStore = useSystemStore()
+ const { isDark } = useTheme()
+ onMounted(async () => {
+   try {
+-    await authStore.checkSetupStatus()
+-    if (authStore.needsSetup) {
++    await setupStore.checkSetupStatus()
++    if (setupStore.needsSetup) {
+       router.push('/setup')
+       return
+     }
+@@ -35,10 +35,7 @@ onMounted(async () => {
+   }
+ 
+   try {
+-    await authStore.checkAuth()
+-    if (authStore.isAuthenticated) {
+-      await systemStore.fetchSystemInfo()
+-    }
++    await systemStore.fetchSystemInfo()
+   } catch {
+   }
+ })
+@@ -46,10 +43,10 @@ onMounted(async () => {
+ 
+ <template>
+   <RouterView v-slot="{ Component, route }">
+-    <KeepAlive v-if="authStore.isAuthenticated">
++    <KeepAlive>
+       <component :is="Component" v-if="route.name === 'Console'" />
+     </KeepAlive>
+-    <component :is="Component" v-if="route.name !== 'Console' || !authStore.isAuthenticated" />
++    <component :is="Component" v-if="route.name !== 'Console'" />
+   </RouterView>
+   <Toaster
+     rich-colors
+diff --git a/web/src/api/config.ts b/web/src/api/config.ts
+index 04ae2f5..ee98388 100644
+--- a/web/src/api/config.ts
++++ b/web/src/api/config.ts
+@@ -1,7 +1,5 @@
+ import type {
+   AppConfig,
+-  AuthConfig,
+-  AuthConfigUpdate,
+   VideoConfig,
+   VideoConfigUpdate,
+   StreamConfigResponse,
+@@ -54,16 +52,6 @@ export const watchdogConfigApi = {
+     }, { toastOnError: false }),
+ }
+ 
+-export const authConfigApi = {
+-  get: () => request<AuthConfig>('/config/auth'),
+-
+-  update: (config: AuthConfigUpdate) =>
+-    request<AuthConfig>('/config/auth', {
+-      method: 'PATCH',
+-      body: JSON.stringify(config),
+-    }),
+-}
+-
+ export const videoConfigApi = {
+   get: () => request<VideoConfig>('/config/video'),
+ 
+diff --git a/web/src/api/index.ts b/web/src/api/index.ts
+index 762ebc6..4822c30 100644
+--- a/web/src/api/index.ts
++++ b/web/src/api/index.ts
+@@ -14,86 +14,6 @@ import type { StreamSignalReason, StreamState } from '@/types/websocket'
+ 
+ const API_BASE = '/api'
+ 
+-export const authApi = {
+-  login: (username: string, password: string) =>
+-    request<AuthLoginResponse>(
+-      '/auth/login',
+-      {
+-        method: 'POST',
+-        body: JSON.stringify({ username, password }),
+-      },
+-      { toastOnError: false },
+-    ),
+-
+-  loginTotp: (challengeId: string, code: string) =>
+-    request<AuthLoginResponse>(
+-      '/auth/login/totp',
+-      {
+-        method: 'POST',
+-        body: JSON.stringify({ challenge_id: challengeId, code }),
+-      },
+-      { toastOnError: false },
+-    ),
+-
+-  logout: () =>
+-    request<{ success: boolean }>('/auth/logout', { method: 'POST' }),
+-
+-  check: () =>
+-    request<{ authenticated: boolean; user?: string }>('/auth/check'),
+-
+-  changePassword: (currentPassword: string, newPassword: string) =>
+-    request<{ success: boolean }>('/auth/password', {
+-      method: 'POST',
+-      body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+-    }),
+-
+-  changeUsername: (username: string, currentPassword: string) =>
+-    request<{ success: boolean }>('/auth/username', {
+-      method: 'POST',
+-      body: JSON.stringify({ username, current_password: currentPassword }),
+-    }),
+-
+-  totpStatus: () =>
+-    request<TotpStatusResponse>('/auth/totp'),
+-
+-  beginTotpEnrollment: (currentPassword: string) =>
+-    request<TotpEnrollmentResponse>('/auth/totp/enrollment', {
+-      method: 'POST',
+-      body: JSON.stringify({ current_password: currentPassword }),
+-    }, { toastOnError: false }),
+-
+-  confirmTotpEnrollment: (enrollmentId: string, code: string) =>
+-    request<{ success: boolean }>('/auth/totp/enrollment/confirm', {
+-      method: 'POST',
+-      body: JSON.stringify({ enrollment_id: enrollmentId, code }),
+-    }, { toastOnError: false }),
+-
+-  disableTotp: (currentPassword: string, code: string) =>
+-    request<{ success: boolean }>('/auth/totp/disable', {
+-      method: 'POST',
+-      body: JSON.stringify({ current_password: currentPassword, code }),
+-    }, { toastOnError: false }),
+-}
+-
+-export interface AuthLoginResponse {
+-  next: 'authenticated' | 'totp'
+-  challenge_id?: string
+-  expires_at_unix_ms?: number
+-}
+-
+-export interface TotpStatusResponse {
+-  enabled: boolean
+-  server_time_unix_ms: number
+-}
+-
+-export interface TotpEnrollmentResponse {
+-  enrollment_id: string
+-  secret: string
+-  otpauth_uri: string
+-  expires_at_unix_ms: number
+-  server_time_unix_ms: number
+-}
+-
+ export interface NetworkAddress {
+   interface: string
+   ip: string
+@@ -162,8 +82,6 @@ export const systemApi = {
+     request<{ initialized: boolean; needs_setup: boolean; platform: PlatformCapabilities }>('/setup'),
+ 
+   setup: (data: {
+-    username: string
+-    password: string
+     video_device?: string
+     video_format?: string
+     video_width?: number
+@@ -829,7 +747,6 @@ export const configApi = {
+ }
+ 
+ export {
+-  authConfigApi,
+   videoConfigApi,
+   streamConfigApi,
+   hidConfigApi,
+diff --git a/web/src/components/AppLayout.vue b/web/src/components/AppLayout.vue
+index 70ffd57..0acde7d 100644
+--- a/web/src/components/AppLayout.vue
++++ b/web/src/components/AppLayout.vue
+@@ -1,35 +1,19 @@
+ <script setup lang="ts">
+-import { RouterLink, useRouter } from 'vue-router'
++import { RouterLink } from 'vue-router'
+ import { useI18n } from 'vue-i18n'
+-import { useAuthStore } from '@/stores/auth'
+ import { useSystemStore } from '@/stores/system'
+ import LanguageToggleButton from '@/components/LanguageToggleButton.vue'
+ import BrandMark from '@/components/BrandMark.vue'
+ import { Button } from '@/components/ui/button'
+ import { useTheme } from '@/composables/useTheme'
+ import {
+-  DropdownMenu,
+-  DropdownMenuContent,
+-  DropdownMenuItem,
+-  DropdownMenuTrigger,
+-} from '@/components/ui/dropdown-menu'
+-import {
+-  LogOut,
+   Sun,
+   Moon,
+-  Menu,
+ } from 'lucide-vue-next'
+ 
+ const { t } = useI18n()
+-const router = useRouter()
+-const authStore = useAuthStore()
+ const systemStore = useSystemStore()
+ const { toggleTheme } = useTheme()
+-
+-async function handleLogout() {
+-  await authStore.logout()
+-  router.push('/login')
+-}
+ </script>
+ 
+ <template>
+@@ -60,27 +44,6 @@ async function handleLogout() {
+ 
+           <!-- Language Toggle -->
+           <LanguageToggleButton />
+-
+-          <!-- Mobile Menu -->
+-          <DropdownMenu>
+-            <DropdownMenuTrigger as-child class="md:hidden">
+-              <Button variant="ghost" size="icon-sm" :aria-label="t('common.menu')">
+-                <Menu class="size-4" />
+-              </Button>
+-            </DropdownMenuTrigger>
+-            <DropdownMenuContent align="end">
+-              <DropdownMenuItem @click="handleLogout">
+-                <LogOut class="size-4 mr-2" />
+-                {{ t('nav.logout') }}
+-              </DropdownMenuItem>
+-            </DropdownMenuContent>
+-          </DropdownMenu>
+-
+-          <!-- Logout Button (Desktop) -->
+-          <Button variant="ghost" size="icon-sm" class="hidden md:flex" :aria-label="t('nav.logout')" @click="handleLogout">
+-            <LogOut class="size-4" />
+-            <span class="sr-only">{{ t('nav.logout') }}</span>
+-          </Button>
+         </div>
+       </div>
+     </header>
+diff --git a/web/src/components/TotpSettingsCard.vue b/web/src/components/TotpSettingsCard.vue
+deleted file mode 100644
+index d52ebe8..0000000
+--- a/web/src/components/TotpSettingsCard.vue
++++ /dev/null
+@@ -1,338 +0,0 @@
+-<script setup lang="ts">
+-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+-import { useI18n } from 'vue-i18n'
+-import QrcodeVue from 'qrcode.vue'
+-import { authApi } from '@/api'
+-import { Alert, AlertDescription } from '@/components/ui/alert'
+-import { Badge } from '@/components/ui/badge'
+-import { Button } from '@/components/ui/button'
+-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
+-import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+-import { Input } from '@/components/ui/input'
+-import { Label } from '@/components/ui/label'
+-import { AlertTriangle, KeyRound, Loader2, ShieldCheck, ShieldOff } from 'lucide-vue-next'
+-
+-const { t, locale } = useI18n()
+-
+-const enabled = ref(false)
+-const statusLoading = ref(true)
+-const statusError = ref('')
+-const now = ref(Date.now())
+-const serverOffsetMs = ref(0)
+-const nextSyncAt = ref(0)
+-
+-const enrollmentOpen = ref(false)
+-const enrollmentStep = ref<'password' | 'verify'>('password')
+-const enrollmentLoading = ref(false)
+-const enrollmentError = ref('')
+-const enrollmentPassword = ref('')
+-const enrollmentCode = ref('')
+-const enrollmentId = ref('')
+-const enrollmentSecret = ref('')
+-const enrollmentUri = ref('')
+-const enrollmentExpiresAt = ref(0)
+-
+-const disableOpen = ref(false)
+-const disableLoading = ref(false)
+-const disableError = ref('')
+-const disablePassword = ref('')
+-const disableCode = ref('')
+-
+-const serverTime = computed(() => formatDate(now.value + serverOffsetMs.value, true))
+-const localTime = computed(() => formatDate(now.value, false))
+-const clockOffsetSeconds = computed(() => Math.round(serverOffsetMs.value / 1000))
+-const clockDriftWarning = computed(() => Math.abs(serverOffsetMs.value) >= 30_000)
+-
+-let timer: ReturnType<typeof setInterval> | undefined
+-let statusSyncing = false
+-
+-function formatDate(timestamp: number, utc: boolean) {
+-  return new Intl.DateTimeFormat(locale.value, {
+-    dateStyle: 'medium',
+-    timeStyle: 'medium',
+-    ...(utc ? { timeZone: 'UTC' } : {}),
+-  }).format(new Date(timestamp))
+-}
+-
+-function applyServerTime(serverTimeUnixMs: number, requestStartedAt: number) {
+-  const localMidpoint = Math.round((requestStartedAt + Date.now()) / 2)
+-  serverOffsetMs.value = serverTimeUnixMs - localMidpoint
+-  nextSyncAt.value = Date.now() + 60_000
+-}
+-
+-async function loadStatus() {
+-  if (statusSyncing) return
+-  statusSyncing = true
+-  const startedAt = Date.now()
+-  try {
+-    const status = await authApi.totpStatus()
+-    enabled.value = status.enabled
+-    applyServerTime(status.server_time_unix_ms, startedAt)
+-    statusError.value = ''
+-  } catch {
+-    statusError.value = t('settings.totp.loadFailed')
+-    nextSyncAt.value = Date.now() + 60_000
+-  } finally {
+-    statusSyncing = false
+-    statusLoading.value = false
+-  }
+-}
+-
+-function normalizeCode(value: string) {
+-  return value.replace(/\D/g, '').slice(0, 6)
+-}
+-
+-function localizedError(error: unknown) {
+-  const raw = error instanceof Error ? error.message : ''
+-  if (raw.includes('Current password is incorrect')) return t('settings.totp.currentPasswordIncorrect')
+-  if (raw.includes('Invalid TOTP code')) return t('settings.totp.invalidCode')
+-  if (raw.includes('enrollment expired')) return t('settings.totp.enrollmentExpired')
+-  if (raw.includes('Too many attempts')) return t('settings.totp.rateLimited')
+-  if (raw.includes('already enabled')) return t('settings.totp.alreadyEnabled')
+-  if (raw.includes('not enabled')) return t('settings.totp.notEnabled')
+-  return raw || t('settings.totp.operationFailed')
+-}
+-
+-async function beginEnrollment() {
+-  if (!enrollmentPassword.value) {
+-    enrollmentError.value = t('auth.enterPassword')
+-    return
+-  }
+-  enrollmentLoading.value = true
+-  enrollmentError.value = ''
+-  const startedAt = Date.now()
+-  try {
+-    const result = await authApi.beginTotpEnrollment(enrollmentPassword.value)
+-    enrollmentPassword.value = ''
+-    enrollmentId.value = result.enrollment_id
+-    enrollmentSecret.value = result.secret
+-    enrollmentUri.value = result.otpauth_uri
+-    enrollmentExpiresAt.value = result.expires_at_unix_ms
+-    applyServerTime(result.server_time_unix_ms, startedAt)
+-    enrollmentStep.value = 'verify'
+-  } catch (error) {
+-    enrollmentError.value = localizedError(error)
+-  } finally {
+-    enrollmentLoading.value = false
+-  }
+-}
+-
+-async function confirmEnrollment() {
+-  enrollmentCode.value = normalizeCode(enrollmentCode.value)
+-  if (enrollmentCode.value.length !== 6) {
+-    enrollmentError.value = t('settings.totp.enterSixDigitCode')
+-    return
+-  }
+-  enrollmentLoading.value = true
+-  enrollmentError.value = ''
+-  try {
+-    await authApi.confirmTotpEnrollment(enrollmentId.value, enrollmentCode.value)
+-    enabled.value = true
+-    enrollmentOpen.value = false
+-  } catch (error) {
+-    enrollmentError.value = localizedError(error)
+-    enrollmentCode.value = ''
+-    if (error instanceof Error && error.message.includes('enrollment expired')) {
+-      clearEnrollmentSecret()
+-      enrollmentStep.value = 'password'
+-    }
+-  } finally {
+-    enrollmentLoading.value = false
+-  }
+-}
+-
+-async function disableTotp() {
+-  disableCode.value = normalizeCode(disableCode.value)
+-  if (!disablePassword.value) {
+-    disableError.value = t('auth.enterPassword')
+-    return
+-  }
+-  if (disableCode.value.length !== 6) {
+-    disableError.value = t('settings.totp.enterSixDigitCode')
+-    return
+-  }
+-  disableLoading.value = true
+-  disableError.value = ''
+-  try {
+-    await authApi.disableTotp(disablePassword.value, disableCode.value)
+-    enabled.value = false
+-    disableOpen.value = false
+-  } catch (error) {
+-    disableError.value = localizedError(error)
+-    disableCode.value = ''
+-  } finally {
+-    disableLoading.value = false
+-  }
+-}
+-
+-function clearEnrollmentSecret() {
+-  enrollmentId.value = ''
+-  enrollmentSecret.value = ''
+-  enrollmentUri.value = ''
+-  enrollmentExpiresAt.value = 0
+-  enrollmentCode.value = ''
+-}
+-
+-function resetEnrollment() {
+-  clearEnrollmentSecret()
+-  enrollmentPassword.value = ''
+-  enrollmentError.value = ''
+-  enrollmentStep.value = 'password'
+-}
+-
+-function resetDisable() {
+-  disablePassword.value = ''
+-  disableCode.value = ''
+-  disableError.value = ''
+-}
+-
+-watch(enrollmentOpen, (open) => {
+-  if (!open) resetEnrollment()
+-})
+-watch(disableOpen, (open) => {
+-  if (!open) resetDisable()
+-})
+-
+-onMounted(async () => {
+-  await loadStatus()
+-  timer = setInterval(() => {
+-    now.value = Date.now()
+-    if (enrollmentId.value && now.value >= enrollmentExpiresAt.value) {
+-      clearEnrollmentSecret()
+-      enrollmentStep.value = 'password'
+-      enrollmentError.value = t('settings.totp.enrollmentExpired')
+-    }
+-    if (now.value >= nextSyncAt.value) void loadStatus()
+-  }, 1000)
+-})
+-
+-onUnmounted(() => {
+-  if (timer) clearInterval(timer)
+-  resetEnrollment()
+-  resetDisable()
+-})
+-</script>
+-
+-<template>
+-  <Card>
+-    <CardHeader class="flex flex-row items-start justify-between gap-4 space-y-0">
+-      <div class="space-y-1.5">
+-        <CardTitle>{{ t('settings.totp.title') }}</CardTitle>
+-        <CardDescription>{{ t('settings.totp.description') }}</CardDescription>
+-      </div>
+-      <Badge :variant="enabled ? 'default' : 'secondary'">
+-        {{ enabled ? t('common.enabled') : t('common.disabled') }}
+-      </Badge>
+-    </CardHeader>
+-    <CardContent class="space-y-4">
+-      <div class="grid gap-3 text-sm sm:grid-cols-2">
+-        <div class="space-y-1">
+-          <p class="text-xs text-muted-foreground">{{ t('settings.totp.serverTime') }}</p>
+-          <p class="font-mono">{{ serverTime }} UTC</p>
+-        </div>
+-        <div class="space-y-1">
+-          <p class="text-xs text-muted-foreground">{{ t('settings.totp.localTime') }}</p>
+-          <p class="font-mono">{{ localTime }}</p>
+-        </div>
+-      </div>
+-      <p class="text-xs text-muted-foreground">
+-        {{ t('settings.totp.clockOffset', { seconds: clockOffsetSeconds }) }}
+-      </p>
+-      <Alert v-if="clockDriftWarning" variant="destructive">
+-        <AlertTriangle />
+-        <AlertDescription>{{ t('settings.totp.clockDriftWarning') }}</AlertDescription>
+-      </Alert>
+-      <Alert v-if="statusError" variant="destructive">
+-        <AlertTriangle />
+-        <AlertDescription>{{ statusError }}</AlertDescription>
+-      </Alert>
+-    </CardContent>
+-    <CardFooter class="border-t pt-4 justify-end">
+-      <Button v-if="!enabled" :disabled="statusLoading" @click="enrollmentOpen = true">
+-        <ShieldCheck class="size-4" />
+-        {{ t('settings.totp.enable') }}
+-      </Button>
+-      <Button v-else variant="destructive" :disabled="statusLoading" @click="disableOpen = true">
+-        <ShieldOff class="size-4" />
+-        {{ t('settings.totp.disable') }}
+-      </Button>
+-    </CardFooter>
+-  </Card>
+-
+-  <Dialog v-model:open="enrollmentOpen">
+-    <DialogContent class="sm:max-w-md">
+-      <DialogHeader>
+-        <DialogTitle>{{ t('settings.totp.enableTitle') }}</DialogTitle>
+-      </DialogHeader>
+-
+-      <div v-if="enrollmentStep === 'password'" class="space-y-4">
+-        <div class="space-y-2">
+-          <Label for="totp-enrollment-password">{{ t('settings.currentPassword') }}</Label>
+-          <Input id="totp-enrollment-password" v-model="enrollmentPassword" type="password" autocomplete="current-password" />
+-        </div>
+-      </div>
+-      <div v-else class="space-y-4">
+-        <div class="flex justify-center rounded-md border bg-white p-3">
+-          <QrcodeVue :value="enrollmentUri" :size="200" level="M" />
+-        </div>
+-        <div class="space-y-2">
+-          <Label>{{ t('settings.totp.manualSecret') }}</Label>
+-          <Input :model-value="enrollmentSecret" readonly class="font-mono" />
+-          <p class="text-xs text-muted-foreground">{{ t('settings.totp.secretOneTime') }}</p>
+-        </div>
+-        <div class="space-y-2">
+-          <Label for="totp-enrollment-code">{{ t('auth.totpCode') }}</Label>
+-          <div class="relative">
+-            <KeyRound class="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+-            <Input id="totp-enrollment-code" v-model="enrollmentCode" inputmode="numeric" autocomplete="one-time-code" maxlength="6" class="pl-10 font-mono" @input="enrollmentCode = normalizeCode(enrollmentCode)" />
+-          </div>
+-        </div>
+-      </div>
+-
+-      <Alert v-if="enrollmentError" variant="destructive">
+-        <AlertTriangle />
+-        <AlertDescription>{{ enrollmentError }}</AlertDescription>
+-      </Alert>
+-      <DialogFooter>
+-        <Button variant="outline" :disabled="enrollmentLoading" @click="enrollmentOpen = false">{{ t('common.cancel') }}</Button>
+-        <Button v-if="enrollmentStep === 'password'" :disabled="enrollmentLoading" @click="beginEnrollment">
+-          <Loader2 v-if="enrollmentLoading" class="size-4 animate-spin" />
+-          {{ t('common.next') }}
+-        </Button>
+-        <Button v-else :disabled="enrollmentLoading" @click="confirmEnrollment">
+-          <Loader2 v-if="enrollmentLoading" class="size-4 animate-spin" />
+-          {{ t('common.confirm') }}
+-        </Button>
+-      </DialogFooter>
+-    </DialogContent>
+-  </Dialog>
+-
+-  <Dialog v-model:open="disableOpen">
+-    <DialogContent class="sm:max-w-md">
+-      <DialogHeader>
+-        <DialogTitle>{{ t('settings.totp.disableTitle') }}</DialogTitle>
+-      </DialogHeader>
+-      <div class="space-y-4">
+-        <div class="space-y-2">
+-          <Label for="totp-disable-password">{{ t('settings.currentPassword') }}</Label>
+-          <Input id="totp-disable-password" v-model="disablePassword" type="password" autocomplete="current-password" />
+-        </div>
+-        <div class="space-y-2">
+-          <Label for="totp-disable-code">{{ t('auth.totpCode') }}</Label>
+-          <Input id="totp-disable-code" v-model="disableCode" inputmode="numeric" autocomplete="one-time-code" maxlength="6" class="font-mono" @input="disableCode = normalizeCode(disableCode)" />
+-        </div>
+-        <Alert v-if="disableError" variant="destructive">
+-          <AlertTriangle />
+-          <AlertDescription>{{ disableError }}</AlertDescription>
+-        </Alert>
+-      </div>
+-      <DialogFooter>
+-        <Button variant="outline" :disabled="disableLoading" @click="disableOpen = false">{{ t('common.cancel') }}</Button>
+-        <Button variant="destructive" :disabled="disableLoading" @click="disableTotp">
+-          <Loader2 v-if="disableLoading" class="size-4 animate-spin" />
+-          {{ t('settings.totp.disable') }}
+-        </Button>
+-      </DialogFooter>
+-    </DialogContent>
+-  </Dialog>
+-</template>
+diff --git a/web/src/router/index.ts b/web/src/router/index.ts
+index cf8d5dc..e2f8243 100644
+--- a/web/src/router/index.ts
++++ b/web/src/router/index.ts
+@@ -1,33 +1,21 @@
+ import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
+-import { toast } from 'vue-sonner'
+-import i18n from '@/i18n'
+-import { ApiError } from '@/api/request'
+-import { useAuthStore } from '@/stores/auth'
++import { useSetupStore } from '@/stores/setup'
+ 
+ const routes: RouteRecordRaw[] = [
+-  {
+-    path: '/login',
+-    name: 'Login',
+-    component: () => import('@/views/LoginView.vue'),
+-    meta: { requiresAuth: false },
+-  },
+   {
+     path: '/setup',
+     name: 'Setup',
+     component: () => import('@/views/SetupView.vue'),
+-    meta: { requiresAuth: false },
+   },
+   {
+     path: '/',
+     name: 'Console',
+     component: () => import('@/views/ConsoleView.vue'),
+-    meta: { requiresAuth: true },
+   },
+   {
+     path: '/settings',
+     name: 'Settings',
+     component: () => import('@/views/SettingsView.vue'),
+-    meta: { requiresAuth: true },
+   },
+ ]
+ 
+@@ -36,63 +24,23 @@ const router = createRouter({
+   routes,
+ })
+ 
+-let sessionExpiredNotified = false
+-
+-function t(key: string, params?: Record<string, unknown>): string {
+-  return String(i18n.global.t(key, params as any))
+-}
+-
+ router.beforeEach(async (to, _from, next) => {
+-  const authStore = useAuthStore()
++  const setupStore = useSetupStore()
+ 
+-  const shouldCheckSetup = to.name === 'Setup' || !authStore.initialized
++  const shouldCheckSetup = to.name === 'Setup' || !setupStore.initialized
+   if (shouldCheckSetup) {
+     try {
+-      await authStore.checkSetupStatus()
++      await setupStore.checkSetupStatus()
+     } catch {
+     }
+   }
+ 
+-  if (authStore.needsSetup) {
++  if (setupStore.needsSetup) {
+     if (to.name !== 'Setup') {
+       return next({ name: 'Setup' })
+     }
+-  } else if (authStore.initialized && to.name === 'Setup') {
+-    if (!authStore.isAuthenticated) {
+-      try {
+-        await authStore.checkAuth()
+-      } catch {
+-      }
+-    }
+-
+-    return next({ name: authStore.isAuthenticated ? 'Console' : 'Login' })
+-  }
+-
+-  if (to.meta.requiresAuth !== false) {
+-    if (!authStore.isAuthenticated) {
+-      try {
+-        await authStore.checkAuth()
+-      } catch (e) {
+-        if (e instanceof ApiError && e.status === 401 && !sessionExpiredNotified) {
+-          const normalized = e.message.toLowerCase()
+-          const isLoggedInElsewhere = normalized.includes('logged in elsewhere')
+-          const isSessionExpired = normalized.includes('session expired')
+-          if (isLoggedInElsewhere || isSessionExpired) {
+-            sessionExpiredNotified = true
+-            const titleKey = isLoggedInElsewhere ? 'auth.loggedInElsewhere' : 'auth.sessionExpired'
+-            toast.error(t(titleKey), {
+-              description: e.message,
+-              duration: 3000,
+-            })
+-          }
+-        }
+-      }
+-
+-      if (!authStore.isAuthenticated) {
+-        return next({ name: 'Login', query: { redirect: to.fullPath } })
+-      }
+-    }
+-
++  } else if (setupStore.initialized && to.name === 'Setup') {
++    return next({ name: 'Console' })
+   }
+ 
+   next()
+diff --git a/web/src/stores/auth.ts b/web/src/stores/auth.ts
+deleted file mode 100644
+index 1fe04f5..0000000
+--- a/web/src/stores/auth.ts
++++ /dev/null
+@@ -1,149 +0,0 @@
+-import { defineStore } from 'pinia'
+-import { ref, computed } from 'vue'
+-import { authApi, systemApi, type AuthLoginResponse } from '@/api'
+-
+-export const useAuthStore = defineStore('auth', () => {
+-  const user = ref<string | null>(null)
+-  const isAuthenticated = ref(false)
+-  const initialized = ref(false)
+-  const needsSetup = ref(false)
+-  const loading = ref(false)
+-  const error = ref<string | null>(null)
+-  let pendingUsername: string | null = null
+-
+-  const isLoggedIn = computed(() => isAuthenticated.value && user.value !== null)
+-
+-  async function checkSetupStatus() {
+-    try {
+-      const status = await systemApi.setupStatus()
+-      initialized.value = status.initialized
+-      needsSetup.value = status.needs_setup
+-      return status
+-    } catch (e) {
+-      console.error('Failed to check setup status:', e)
+-      throw e
+-    }
+-  }
+-
+-  async function checkAuth() {
+-    try {
+-      const result = await authApi.check()
+-      isAuthenticated.value = result.authenticated
+-      user.value = result.user || null
+-      return result
+-    } catch (e) {
+-      isAuthenticated.value = false
+-      user.value = null
+-      error.value = e instanceof Error ? e.message : 'Not authenticated'
+-      if (e instanceof Error) {
+-        throw e
+-      }
+-      throw new Error('Not authenticated')
+-    }
+-  }
+-
+-  async function beginLogin(username: string, password: string): Promise<AuthLoginResponse | null> {
+-    loading.value = true
+-    error.value = null
+-
+-    try {
+-      const result = await authApi.login(username, password)
+-      if (result.next === 'authenticated') {
+-        isAuthenticated.value = true
+-        user.value = username
+-        pendingUsername = null
+-      } else {
+-        isAuthenticated.value = false
+-        user.value = null
+-        pendingUsername = username
+-      }
+-      return result
+-    } catch (e) {
+-      error.value = e instanceof Error ? e.message : 'Login failed'
+-      pendingUsername = null
+-      return null
+-    } finally {
+-      loading.value = false
+-    }
+-  }
+-
+-  async function completeTotpLogin(challengeId: string, code: string) {
+-    loading.value = true
+-    error.value = null
+-    try {
+-      const result = await authApi.loginTotp(challengeId, code)
+-      if (result.next !== 'authenticated') {
+-        error.value = 'Login failed'
+-        return false
+-      }
+-      isAuthenticated.value = true
+-      user.value = pendingUsername
+-      pendingUsername = null
+-      return true
+-    } catch (e) {
+-      error.value = e instanceof Error ? e.message : 'Login failed'
+-      return false
+-    } finally {
+-      loading.value = false
+-    }
+-  }
+-
+-  async function login(username: string, password: string) {
+-    const result = await beginLogin(username, password)
+-    return result?.next === 'authenticated'
+-  }
+-
+-  function cancelPendingLogin() {
+-    pendingUsername = null
+-    error.value = null
+-  }
+-
+-  async function logout() {
+-    try {
+-      await authApi.logout()
+-    } finally {
+-      isAuthenticated.value = false
+-      user.value = null
+-    }
+-  }
+-
+-  async function setup(data: Parameters<typeof systemApi.setup>[0]) {
+-    loading.value = true
+-    error.value = null
+-
+-    try {
+-      const result = await systemApi.setup(data)
+-      if (result.success) {
+-        initialized.value = true
+-        needsSetup.value = false
+-        return true
+-      } else {
+-        error.value = result.message || 'Setup failed'
+-        return false
+-      }
+-    } catch (e) {
+-      error.value = e instanceof Error ? e.message : 'Setup failed'
+-      return false
+-    } finally {
+-      loading.value = false
+-    }
+-  }
+-
+-  return {
+-    user,
+-    isAuthenticated,
+-    initialized,
+-    needsSetup,
+-    loading,
+-    error,
+-    isLoggedIn,
+-    checkSetupStatus,
+-    checkAuth,
+-    beginLogin,
+-    completeTotpLogin,
+-    cancelPendingLogin,
+-    login,
+-    logout,
+-    setup,
+-  }
+-})
+diff --git a/web/src/stores/config.ts b/web/src/stores/config.ts
+index 81a0d6c..b493f13 100644
+--- a/web/src/stores/config.ts
++++ b/web/src/stores/config.ts
+@@ -1,7 +1,6 @@
+ import { defineStore } from 'pinia'
+ import { ref } from 'vue'
+ import {
+-  authConfigApi,
+   atxConfigApi,
+   audioConfigApi,
+   hidConfigApi,
+@@ -19,8 +18,6 @@ import type {
+   AtxConfigUpdate,
+   AudioConfig,
+   AudioConfigUpdate,
+-  AuthConfig,
+-  AuthConfigUpdate,
+   HidConfig,
+   HidConfigUpdate,
+   MsdConfig,
+@@ -54,7 +51,6 @@ function normalizeErrorMessage(error: unknown): string {
+ }
+ 
+ export const useConfigStore = defineStore('config', () => {
+-  const auth = ref<AuthConfig | null>(null)
+   const video = ref<VideoConfig | null>(null)
+   const audio = ref<AudioConfig | null>(null)
+   const hid = ref<HidConfig | null>(null)
+@@ -70,7 +66,6 @@ export const useConfigStore = defineStore('config', () => {
+   const rustdeskStatus = ref<ApiRustDeskStatusResponse | null>(null)
+   const rustdeskPassword = ref<ApiRustDeskPasswordResponse | null>(null)
+ 
+-  const authLoading = ref(false)
+   const videoLoading = ref(false)
+   const audioLoading = ref(false)
+   const hidLoading = ref(false)
+@@ -82,7 +77,6 @@ export const useConfigStore = defineStore('config', () => {
+   const vncLoading = ref(false)
+   const rustdeskLoading = ref(false)
+ 
+-  const authError = ref<string | null>(null)
+   const videoError = ref<string | null>(null)
+   const audioError = ref<string | null>(null)
+   const hidError = ref<string | null>(null)
+@@ -94,7 +88,6 @@ export const useConfigStore = defineStore('config', () => {
+   const vncError = ref<string | null>(null)
+   const rustdeskError = ref<string | null>(null)
+ 
+-  let authPromise: Promise<AuthConfig> | null = null
+   let videoPromise: Promise<VideoConfig> | null = null
+   let audioPromise: Promise<AudioConfig> | null = null
+   let hidPromise: Promise<HidConfig> | null = null
+@@ -110,28 +103,6 @@ export const useConfigStore = defineStore('config', () => {
+   let rustdeskStatusPromise: Promise<ApiRustDeskStatusResponse> | null = null
+   let rustdeskPasswordPromise: Promise<ApiRustDeskPasswordResponse> | null = null
+ 
+-  async function refreshAuth() {
+-    if (authLoading.value && authPromise) return authPromise
+-    authLoading.value = true
+-    authError.value = null
+-    const request = authConfigApi.get()
+-      .then((response) => {
+-        auth.value = response
+-        return response
+-      })
+-      .catch((error) => {
+-        authError.value = normalizeErrorMessage(error)
+-        throw error
+-      })
+-      .finally(() => {
+-        authLoading.value = false
+-        authPromise = null
+-      })
+-
+-    authPromise = request
+-    return request
+-  }
+-
+   async function refreshVideo() {
+     if (videoLoading.value && videoPromise) return videoPromise
+     videoLoading.value = true
+@@ -443,11 +414,6 @@ export const useConfigStore = defineStore('config', () => {
+     return request
+   }
+ 
+-  function ensureAuth() {
+-    if (auth.value) return Promise.resolve(auth.value)
+-    return refreshAuth()
+-  }
+-
+   function ensureVideo() {
+     if (video.value) return Promise.resolve(video.value)
+     return refreshVideo()
+@@ -498,12 +464,6 @@ export const useConfigStore = defineStore('config', () => {
+     return refreshRustdeskConfig()
+   }
+ 
+-  async function updateAuth(update: AuthConfigUpdate) {
+-    const response = await authConfigApi.update(update)
+-    auth.value = response
+-    return response
+-  }
+-
+   async function updateVideo(update: VideoConfigUpdate) {
+     const response = await videoConfigApi.update(update)
+     video.value = response
+@@ -584,7 +544,6 @@ export const useConfigStore = defineStore('config', () => {
+   }
+ 
+   return {
+-    auth,
+     video,
+     audio,
+     hid,
+@@ -599,7 +558,6 @@ export const useConfigStore = defineStore('config', () => {
+     rustdeskConfig,
+     rustdeskStatus,
+     rustdeskPassword,
+-    authLoading,
+     videoLoading,
+     audioLoading,
+     hidLoading,
+@@ -610,7 +568,6 @@ export const useConfigStore = defineStore('config', () => {
+     rtspLoading,
+     vncLoading,
+     rustdeskLoading,
+-    authError,
+     videoError,
+     audioError,
+     hidError,
+@@ -621,7 +578,6 @@ export const useConfigStore = defineStore('config', () => {
+     rtspError,
+     vncError,
+     rustdeskError,
+-    refreshAuth,
+     refreshVideo,
+     refreshAudio,
+     refreshHid,
+@@ -636,7 +592,6 @@ export const useConfigStore = defineStore('config', () => {
+     refreshRustdeskConfig,
+     refreshRustdeskStatus,
+     refreshRustdeskPassword,
+-    ensureAuth,
+     ensureVideo,
+     ensureAudio,
+     ensureHid,
+@@ -647,7 +602,6 @@ export const useConfigStore = defineStore('config', () => {
+     ensureRtspConfig,
+     ensureVncConfig,
+     ensureRustdeskConfig,
+-    updateAuth,
+     updateVideo,
+     updateAudio,
+     updateHid,
+diff --git a/web/src/stores/index.ts b/web/src/stores/index.ts
+index 638a546..f4d7d7e 100644
+--- a/web/src/stores/index.ts
++++ b/web/src/stores/index.ts
+@@ -1,3 +1,3 @@
+-export { useAuthStore } from './auth'
+ export { useConfigStore } from './config'
++export { useSetupStore } from './setup'
+ export { useSystemStore } from './system'
+diff --git a/web/src/stores/setup.ts b/web/src/stores/setup.ts
+new file mode 100644
+index 0000000..516cc7a
+--- /dev/null
++++ b/web/src/stores/setup.ts
+@@ -0,0 +1,52 @@
++import { defineStore } from 'pinia'
++import { ref } from 'vue'
++import { systemApi } from '@/api'
++
++export const useSetupStore = defineStore('setup', () => {
++  const initialized = ref(false)
++  const needsSetup = ref(false)
++  const loading = ref(false)
++  const error = ref<string | null>(null)
++
++  async function checkSetupStatus() {
++    try {
++      const status = await systemApi.setupStatus()
++      initialized.value = status.initialized
++      needsSetup.value = status.needs_setup
++      return status
++    } catch (e) {
++      console.error('Failed to check setup status:', e)
++      throw e
++    }
++  }
++
++  async function setup(data: Parameters<typeof systemApi.setup>[0]) {
++    loading.value = true
++    error.value = null
++
++    try {
++      const result = await systemApi.setup(data)
++      if (result.success) {
++        initialized.value = true
++        needsSetup.value = false
++        return true
++      }
++      error.value = result.message || 'Setup failed'
++      return false
++    } catch (e) {
++      error.value = e instanceof Error ? e.message : 'Setup failed'
++      return false
++    } finally {
++      loading.value = false
++    }
++  }
++
++  return {
++    initialized,
++    needsSetup,
++    loading,
++    error,
++    checkSetupStatus,
++    setup,
++  }
++})
+diff --git a/web/src/views/ConsoleView.vue b/web/src/views/ConsoleView.vue
+index b7962dc..bedbf86 100644
+--- a/web/src/views/ConsoleView.vue
++++ b/web/src/views/ConsoleView.vue
+@@ -1,10 +1,8 @@
+ <script setup lang="ts">
+ import { ref, onMounted, onUnmounted, onActivated, onDeactivated, computed, watch, nextTick } from 'vue'
+ import { useI18n } from 'vue-i18n'
+-import { useRouter } from 'vue-router'
+ import { useSystemStore } from '@/stores/system'
+ import { useConfigStore } from '@/stores/config'
+-import { useAuthStore } from '@/stores/auth'
+ import { useWebSocket } from '@/composables/useWebSocket'
+ import { useConsoleEvents } from '@/composables/useConsoleEvents'
+ import { useHidWebSocket } from '@/composables/useHidWebSocket'
+@@ -17,7 +15,7 @@ import { useTheme } from '@/composables/useTheme'
+ import { useConsoleLayout } from '@/composables/useConsoleLayout'
+ import { getUnifiedAudio } from '@/composables/useUnifiedAudio'
+ import { getMicrophone } from '@/composables/useMicrophone'
+-import { streamApi, hidApi, atxApi, atxConfigApi, authApi, computerUseApi, uacApi } from '@/api'
++import { streamApi, hidApi, atxApi, atxConfigApi, computerUseApi, uacApi } from '@/api'
+ import type { ComputerUseScreenshot, ComputerUseSession } from '@/api'
+ import { CanonicalKey, HidBackend } from '@/types/generated'
+ import type { HidKeyboardEvent, HidMouseEvent } from '@/types/hid'
+@@ -51,34 +49,18 @@ import {
+   DropdownMenu,
+   DropdownMenuContent,
+   DropdownMenuItem,
+-  DropdownMenuSeparator,
+   DropdownMenuTrigger,
+ } from '@/components/ui/dropdown-menu'
+-import {
+-  Dialog,
+-  DialogContent,
+-  DialogHeader,
+-  DialogTitle,
+-  DialogFooter,
+-} from '@/components/ui/dialog'
+-import { Input } from '@/components/ui/input'
+-import { Label } from '@/components/ui/label'
+ import {
+   MonitorOff,
+   RefreshCw,
+-  LogOut,
+   Sun,
+   Moon,
+-  ChevronDown,
+-  KeyRound,
+-  Loader2,
+ } from 'lucide-vue-next'
+ 
+ const { t, te } = useI18n()
+-const router = useRouter()
+ const systemStore = useSystemStore()
+ const configStore = useConfigStore()
+-const authStore = useAuthStore()
+ const { connected: wsConnected, networkError: wsNetworkError } = useWebSocket()
+ const hidWs = useHidWebSocket()
+ const webrtc = useWebRTC()
+@@ -245,12 +227,6 @@ const virtualKeyboardConsumerEnabled = computed(() => {
+   return hid.otg_functions?.consumer !== false
+ })
+ 
+-const changePasswordDialogOpen = ref(false)
+-const currentPassword = ref('')
+-const newPassword = ref('')
+-const confirmPassword = ref('')
+-const changingPassword = ref(false)
+-
+ const ttydStatus = ref<{ available: boolean; running: boolean } | null>(null)
+ const showTerminalDialog = ref(false)
+ const featureVisibility = useFeatureVisibility()
+@@ -2132,42 +2108,6 @@ async function toggleFullscreen() {
+   }
+ }
+ 
+-async function logout() {
+-  await authStore.logout()
+-  router.push('/login')
+-}
+-
+-async function handleChangePassword() {
+-  if (!newPassword.value || !confirmPassword.value) {
+-    toast.error(t('auth.passwordRequired'))
+-    return
+-  }
+-
+-  if (newPassword.value !== confirmPassword.value) {
+-    toast.error(t('auth.passwordMismatch'))
+-    return
+-  }
+-
+-  if (newPassword.value.length < 4) {
+-    toast.error(t('auth.passwordTooShort'))
+-    return
+-  }
+-
+-  changingPassword.value = true
+-  try {
+-    await authApi.changePassword(currentPassword.value, newPassword.value)
+-
+-    currentPassword.value = ''
+-    newPassword.value = ''
+-    confirmPassword.value = ''
+-    changePasswordDialogOpen.value = false
+-  } catch (e) {
+-    console.info('[ChangePassword] Failed:', e)
+-  } finally {
+-    changingPassword.value = false
+-  }
+-}
+-
+ function openTerminal() {
+   if (!showTerminal.value) return
+   if (!ttydStatus.value?.running) return
+@@ -3318,19 +3258,18 @@ onUnmounted(() => {
+             </Button>
+             <LanguageToggleButton class="size-8 hidden md:flex" />
+             <DropdownMenu>
+-              <DropdownMenuTrigger as-child>
+-                <Button variant="outline" size="sm" class="gap-1 sm:gap-1.5 px-2 sm:px-3">
+-                  <span class="text-xs max-w-[60px] sm:max-w-[100px] truncate">{{ authStore.user || 'admin' }}</span>
+-                  <ChevronDown class="size-3 sm:size-3.5" />
++              <DropdownMenuTrigger as-child class="md:hidden">
++                <Button variant="outline" size="sm" class="px-2">
++                  {{ t('common.menu') }}
+                 </Button>
+               </DropdownMenuTrigger>
+               <DropdownMenuContent align="end">
+-                <DropdownMenuItem class="md:hidden" @click="toggleTheme">
++                <DropdownMenuItem @click="toggleTheme">
+                   <Sun v-if="isDark" class="size-4 mr-2" />
+                   <Moon v-else class="size-4 mr-2" />
+                   {{ isDark ? t('settings.lightMode') : t('settings.darkMode') }}
+                 </DropdownMenuItem>
+-                <DropdownMenuItem as-child class="md:hidden p-0">
++                <DropdownMenuItem as-child class="p-0">
+                   <LanguageToggleButton
+                     label-mode="next"
+                     size="sm"
+@@ -3338,16 +3277,6 @@ onUnmounted(() => {
+                     class="w-full justify-start rounded-sm px-2 py-1.5 font-normal shadow-none"
+                   />
+                 </DropdownMenuItem>
+-                <DropdownMenuSeparator class="md:hidden" />
+-                <DropdownMenuItem @click="changePasswordDialogOpen = true">
+-                  <KeyRound class="size-4 mr-2" />
+-                  {{ t('auth.changePassword') }}
+-                </DropdownMenuItem>
+-                <DropdownMenuSeparator />
+-                <DropdownMenuItem @click="logout">
+-                  <LogOut class="size-4 mr-2" />
+-                  {{ t('auth.logout') }}
+-                </DropdownMenuItem>
+               </DropdownMenuContent>
+             </DropdownMenu>
+           </div>
+@@ -3653,55 +3582,6 @@ onUnmounted(() => {
+       :webrtc-stats="webrtc.stats.value"
+     />
+     <TerminalDialog v-if="showTerminal" v-model:open="showTerminalDialog" />
+-    <Dialog v-model:open="changePasswordDialogOpen">
+-      <DialogContent class="w-[95vw] max-w-md">
+-        <DialogHeader>
+-          <DialogTitle>{{ t('auth.changePassword') }}</DialogTitle>
+-        </DialogHeader>
+-        <div class="space-y-3 sm:space-y-4 py-2 sm:py-4">
+-          <div class="space-y-2">
+-            <Label for="currentPassword">{{ t('auth.currentPassword') }}</Label>
+-            <Input
+-              id="currentPassword"
+-              v-model="currentPassword"
+-              type="password"
+-              autocomplete="current-password"
+-              :placeholder="t('auth.currentPasswordPlaceholder')"
+-            />
+-          </div>
+-          <div class="space-y-2">
+-            <Label for="newPassword">{{ t('auth.newPassword') }}</Label>
+-            <Input
+-              id="newPassword"
+-              v-model="newPassword"
+-              type="password"
+-              autocomplete="new-password"
+-              :placeholder="t('auth.newPasswordPlaceholder')"
+-            />
+-          </div>
+-          <div class="space-y-2">
+-            <Label for="confirmPassword">{{ t('auth.confirmPassword') }}</Label>
+-            <Input
+-              id="confirmPassword"
+-              v-model="confirmPassword"
+-              type="password"
+-              autocomplete="new-password"
+-              :placeholder="t('auth.confirmPasswordPlaceholder')"
+-            />
+-          </div>
+-        </div>
+-        <DialogFooter>
+-          <Button variant="outline" @click="changePasswordDialogOpen = false">
+-            {{ t('common.cancel') }}
+-          </Button>
+-          <Button @click="handleChangePassword" :disabled="changingPassword">
+-            <Loader2 v-if="changingPassword" class="size-4 mr-2 animate-spin" />
+-            {{ t('common.confirm') }}
+-          </Button>
+-        </DialogFooter>
+-      </DialogContent>
+-    </Dialog>
+-
+   </div>
+ </template>
+ 
+diff --git a/web/src/views/LoginView.vue b/web/src/views/LoginView.vue
+deleted file mode 100644
+index 4ba82ca..0000000
+--- a/web/src/views/LoginView.vue
++++ /dev/null
+@@ -1,251 +0,0 @@
+-<script setup lang="ts">
+-import { nextTick, ref } from 'vue'
+-import { useRouter, useRoute } from 'vue-router'
+-import { useI18n } from 'vue-i18n'
+-import { useAuthStore } from '@/stores/auth'
+-import { Button } from '@/components/ui/button'
+-import { Input } from '@/components/ui/input'
+-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+-import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+-import { Alert, AlertDescription } from '@/components/ui/alert'
+-import { Field, FieldGroup, FieldLabel } from '@/components/ui/field'
+-import LanguageToggleButton from '@/components/LanguageToggleButton.vue'
+-import BrandMark from '@/components/BrandMark.vue'
+-import { AlertCircle, ArrowLeft, KeyRound, Lock, Eye, EyeOff, User, CircleHelp } from 'lucide-vue-next'
+-
+-const { t } = useI18n()
+-const router = useRouter()
+-const route = useRoute()
+-const authStore = useAuthStore()
+-
+-/** Map backend English messages to locale strings (API returns fixed English copy). */
+-function localizedLoginError(raw: string | null): string {
+-  if (!raw) return t('auth.loginFailed')
+-  if (raw.includes('Invalid username or password')) return t('auth.invalidPassword')
+-  if (raw.includes('System not initialized')) return t('auth.systemNotInitialized')
+-  if (raw.includes('Invalid TOTP code')) return t('auth.invalidTotpCode')
+-  if (raw.includes('challenge expired')) return t('auth.totpChallengeExpired')
+-  if (raw.includes('Too many attempts')) return t('auth.totpRateLimited')
+-  return raw
+-}
+-
+-const username = ref('')
+-const password = ref('')
+-const showPassword = ref(false)
+-const loading = ref(false)
+-const error = ref('')
+-const step = ref<'password' | 'totp'>('password')
+-const challengeId = ref('')
+-const challengeExpiresAt = ref(0)
+-const totpCode = ref('')
+-
+-function focusTotpInput() {
+-  document.querySelector<HTMLInputElement>('#totp-code')?.focus()
+-}
+-
+-async function handleLogin() {
+-  if (!username.value) {
+-    error.value = t('auth.enterUsername')
+-    return
+-  }
+-  if (!password.value) {
+-    error.value = t('auth.enterPassword')
+-    return
+-  }
+-
+-  loading.value = true
+-  error.value = ''
+-
+-  const result = await authStore.beginLogin(username.value, password.value)
+-
+-  if (result?.next === 'authenticated') {
+-    const redirect = route.query.redirect as string
+-    router.push(redirect || '/')
+-  } else if (result?.next === 'totp' && result.challenge_id && result.expires_at_unix_ms) {
+-    password.value = ''
+-    challengeId.value = result.challenge_id
+-    challengeExpiresAt.value = result.expires_at_unix_ms
+-    step.value = 'totp'
+-    await nextTick()
+-    focusTotpInput()
+-  } else {
+-    error.value = localizedLoginError(authStore.error)
+-  }
+-
+-  loading.value = false
+-}
+-
+-function normalizeTotpCode() {
+-  totpCode.value = totpCode.value.replace(/\D/g, '').slice(0, 6)
+-}
+-
+-async function handleTotpLogin() {
+-  normalizeTotpCode()
+-  if (Date.now() >= challengeExpiresAt.value) {
+-    error.value = t('auth.totpChallengeExpired')
+-    returnToPassword(true)
+-    return
+-  }
+-  if (totpCode.value.length !== 6) {
+-    error.value = t('auth.enterTotpCode')
+-    return
+-  }
+-  loading.value = true
+-  error.value = ''
+-  const success = await authStore.completeTotpLogin(challengeId.value, totpCode.value)
+-  if (success) {
+-    const redirect = route.query.redirect as string
+-    router.push(redirect || '/')
+-  } else {
+-    error.value = localizedLoginError(authStore.error)
+-    if (authStore.error?.includes('challenge expired') || authStore.error?.includes('Too many attempts')) {
+-      returnToPassword(true)
+-    } else {
+-      totpCode.value = ''
+-      await nextTick()
+-      focusTotpInput()
+-    }
+-  }
+-  loading.value = false
+-}
+-
+-function returnToPassword(keepError = false) {
+-  step.value = 'password'
+-  challengeId.value = ''
+-  challengeExpiresAt.value = 0
+-  totpCode.value = ''
+-  authStore.cancelPendingLogin()
+-  if (!keepError) error.value = ''
+-}
+-</script>
+-
+-<template>
+-  <div class="min-h-screen min-h-dvh flex items-center justify-center dot-grid-bg p-4">
+-    <Card class="relative w-full max-w-sm">
+-      <div class="absolute top-4 right-4">
+-        <LanguageToggleButton />
+-      </div>
+-
+-      <CardHeader class="space-y-2 pt-8 text-center">
+-        <div class="mx-auto flex justify-center">
+-          <BrandMark size="lg" />
+-        </div>
+-        <CardTitle class="text-xl">One-KVM</CardTitle>
+-        <CardDescription>{{ step === 'password' ? t('auth.login') : t('auth.totpPrompt') }}</CardDescription>
+-      </CardHeader>
+-
+-      <CardContent>
+-        <form v-if="step === 'password'" @submit.prevent="handleLogin">
+-          <FieldGroup class="gap-5">
+-          <Field>
+-            <FieldLabel for="username">{{ t('auth.username') }}</FieldLabel>
+-            <div class="relative">
+-              <User class="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+-              <Input
+-                id="username"
+-                v-model="username"
+-                type="text"
+-                autocomplete="username"
+-                :placeholder="t('auth.username')"
+-                class="pl-10"
+-              />
+-            </div>
+-          </Field>
+-
+-          <Field>
+-            <div class="flex items-center justify-between gap-2">
+-              <FieldLabel for="password">{{ t('auth.password') }}</FieldLabel>
+-              <Popover>
+-                <PopoverTrigger as-child>
+-                  <Button
+-                    type="button"
+-                    variant="link"
+-                    size="sm"
+-                    class="h-auto gap-1 p-0 text-xs text-muted-foreground"
+-                  >
+-                    {{ t('auth.forgotPassword') }}
+-                    <CircleHelp class="size-3.5" />
+-                  </Button>
+-                </PopoverTrigger>
+-                <PopoverContent class="w-80 p-3" align="end">
+-                  <p class="text-xs text-muted-foreground">
+-                    {{ t('auth.forgotPasswordHint') }}
+-                  </p>
+-                </PopoverContent>
+-              </Popover>
+-            </div>
+-            <div class="relative">
+-              <Lock class="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+-              <Input
+-                id="password"
+-                v-model="password"
+-                :type="showPassword ? 'text' : 'password'"
+-                autocomplete="current-password"
+-                :placeholder="t('auth.password')"
+-                class="pl-10 pr-10"
+-              />
+-              <Button
+-                type="button"
+-                variant="ghost"
+-                size="icon-sm"
+-                class="absolute right-1 top-1/2 -translate-y-1/2 text-muted-foreground"
+-                :aria-label="showPassword ? t('extensions.rustdesk.hidePassword') : t('extensions.rustdesk.showPassword')"
+-                @click="showPassword = !showPassword"
+-              >
+-                <Eye v-if="!showPassword" class="w-4 h-4" />
+-                <EyeOff v-else class="w-4 h-4" />
+-              </Button>
+-            </div>
+-          </Field>
+-
+-          <Alert v-if="error" variant="destructive">
+-            <AlertCircle />
+-            <AlertDescription>{{ error }}</AlertDescription>
+-          </Alert>
+-
+-          <Button type="submit" class="w-full" :disabled="loading">
+-            <span v-if="loading">{{ t('common.loading') }}</span>
+-            <span v-else>{{ t('auth.login') }}</span>
+-          </Button>
+-
+-          </FieldGroup>
+-        </form>
+-        <form v-else @submit.prevent="handleTotpLogin">
+-          <FieldGroup class="gap-5">
+-            <Field>
+-              <FieldLabel for="totp-code">{{ t('auth.totpCode') }}</FieldLabel>
+-              <div class="relative">
+-                <KeyRound class="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+-                <Input
+-                  id="totp-code"
+-                  v-model="totpCode"
+-                  type="text"
+-                  inputmode="numeric"
+-                  autocomplete="one-time-code"
+-                  maxlength="6"
+-                  class="pl-10 font-mono text-lg"
+-                  :placeholder="t('auth.totpCodePlaceholder')"
+-                  @input="normalizeTotpCode"
+-                />
+-              </div>
+-            </Field>
+-
+-            <Alert v-if="error" variant="destructive">
+-              <AlertCircle />
+-              <AlertDescription>{{ error }}</AlertDescription>
+-            </Alert>
+-
+-            <Button type="submit" class="w-full" :disabled="loading">
+-              <span v-if="loading">{{ t('common.loading') }}</span>
+-              <span v-else>{{ t('auth.verifyAndLogin') }}</span>
+-            </Button>
+-            <Button type="button" variant="ghost" class="w-full" :disabled="loading" @click="returnToPassword()">
+-              <ArrowLeft class="size-4" />
+-              {{ t('auth.backToPassword') }}
+-            </Button>
+-          </FieldGroup>
+-        </form>
+-      </CardContent>
+-    </Card>
+-  </div>
+-</template>
+diff --git a/web/src/views/SettingsView.vue b/web/src/views/SettingsView.vue
+index 9fa53a4..5569a2c 100644
+--- a/web/src/views/SettingsView.vue
++++ b/web/src/views/SettingsView.vue
+@@ -5,12 +5,9 @@ import { ref, computed, onMounted, watch, nextTick } from 'vue'
+ import { useI18n } from 'vue-i18n'
+ import { useRoute, useRouter } from 'vue-router'
+ import { toast } from 'vue-sonner'
+-import { ApiError } from '@/api/request'
+ import { useSystemStore } from '@/stores/system'
+ import { useConfigStore } from '@/stores/config'
+-import { useAuthStore } from '@/stores/auth'
+ import {
+-  authApi,
+   configApi,
+   otgNetworkApi,
+   uacApi,
+@@ -27,7 +24,6 @@ import {
+   vncConfigApi,
+   watchdogConfigApi,
+   type EncoderBackendInfo,
+-  type AuthConfig,
+   type RustDeskConfigResponse,
+   type RustDeskStatusResponse,
+   type RustDeskPasswordResponse,
+@@ -69,7 +65,6 @@ import { formatVideoDeviceLabel } from '@/lib/video-device-label'
+ import AppLayout from '@/components/AppLayout.vue'
+ import LanguageToggleButton from '@/components/LanguageToggleButton.vue'
+ import TerminalDialog from '@/components/TerminalDialog.vue'
+-import TotpSettingsCard from '@/components/TotpSettingsCard.vue'
+ import VideoInputFields from '@/components/VideoInputFields.vue'
+ import ExtensionConfigModeEditor from '@/components/ExtensionConfigModeEditor.vue'
+ import { Button } from '@/components/ui/button'
+@@ -130,7 +125,6 @@ import {
+   Power,
+   Server,
+   Lock,
+-  User,
+   RefreshCw,
+   Terminal,
+   Play,
+@@ -157,7 +151,6 @@ const route = useRoute()
+ const router = useRouter()
+ const systemStore = useSystemStore()
+ const configStore = useConfigStore()
+-const authStore = useAuthStore()
+ const featureVisibility = useFeatureVisibility()
+ const { theme, setTheme } = useTheme()
+ const { consoleLayout, setConsoleLayout } = useConsoleLayout()
+@@ -179,7 +172,6 @@ const saved = ref(false)
+ const saveError = ref('')
+ const SETTINGS_SECTION_IDS = [
+   'appearance',
+-  'account',
+   'network',
+   'video',
+   'hid',
+@@ -199,7 +191,6 @@ const navGroups = computed(() => [
+     title: t('settings.software'),
+     items: [
+       { id: 'appearance', label: t('settings.appearance'), icon: Sun },
+-      { id: 'account', label: t('settings.account'), icon: User },
+       { id: 'network', label: t('settings.network'), icon: Globe },
+       { id: 'about', label: t('settings.about'), icon: Info },
+     ]
+@@ -262,7 +253,7 @@ function selectSection(id: string) {
+ 
+ function normalizeSettingsSection(value: unknown): SettingsSectionId | null {
+   if (typeof value !== 'string') return null
+-  if (value === 'access-control') return 'account'
++  if (value === 'access-control') return 'appearance'
+   if (value === 'ext-frpc') return 'ext-remote-access'
+   if (value === 'redfish') return 'third-party-access'
+   if (value === 'msd') return 'hid'
+@@ -280,9 +271,6 @@ async function loadSectionData(section: SettingsSectionId) {
+   switch (section) {
+     case 'appearance':
+       return
+-    case 'account':
+-      await loadAuthConfig()
+-      return
+     case 'network':
+       await loadWebServerConfig()
+       return
+@@ -334,23 +322,7 @@ async function loadSectionData(section: SettingsSectionId) {
+   }
+ }
+ 
+-const usernameInput = ref('')
+-const usernamePassword = ref('')
+-const usernameSaving = ref(false)
+-const usernameSaved = ref(false)
+-const usernameError = ref('')
+-const currentPassword = ref('')
+-const newPassword = ref('')
+-const confirmPassword = ref('')
+-const passwordSaving = ref(false)
+-const passwordSaved = ref(false)
+-const passwordError = ref('')
+ const showPasswords = ref(false)
+-const authConfig = ref<AuthConfig>({
+-  session_timeout_secs: 3600 * 24,
+-  single_user_allow_multiple_sessions: false,
+-})
+-const authConfigLoading = ref(false)
+ 
+ const watchdogStatus = ref<WatchdogConfigResponse | null>(null)
+ const watchdogLoading = ref(false)
+@@ -1339,13 +1311,6 @@ watch(
+   { deep: true },
+ )
+ 
+-watch(() => authStore.user, (value) => {
+-  if (value) {
+-    usernameInput.value = value
+-  }
+-})
+-
+-
+ function formatBytes(bytes: number): string {
+   if (bytes === 0) return '0 B'
+   const k = 1024
+@@ -1367,70 +1332,6 @@ const hasDeviceNetworkAddresses = computed(() => {
+   return (systemStore.deviceInfo?.network_addresses.length ?? 0) > 0
+ })
+ 
+-async function changeUsername() {
+-  usernameError.value = ''
+-  usernameSaved.value = false
+-
+-  if (usernameInput.value.length < 2) {
+-    usernameError.value = t('auth.enterUsername')
+-    return
+-  }
+-  if (!usernamePassword.value) {
+-    usernameError.value = t('auth.enterPassword')
+-    return
+-  }
+-
+-  usernameSaving.value = true
+-  try {
+-    await authApi.changeUsername(usernameInput.value, usernamePassword.value)
+-    usernameSaved.value = true
+-    usernamePassword.value = ''
+-    await authStore.checkAuth()
+-    usernameInput.value = authStore.user || usernameInput.value
+-    setTimeout(() => {
+-      usernameSaved.value = false
+-    }, 2000)
+-  } catch (e) {
+-    usernameError.value = t('auth.invalidPassword')
+-  } finally {
+-    usernameSaving.value = false
+-  }
+-}
+-
+-async function changePassword() {
+-  passwordError.value = ''
+-  passwordSaved.value = false
+-
+-  if (!currentPassword.value) {
+-    passwordError.value = t('auth.enterPassword')
+-    return
+-  }
+-  if (newPassword.value.length < 4) {
+-    passwordError.value = t('setup.passwordHint')
+-    return
+-  }
+-  if (newPassword.value !== confirmPassword.value) {
+-    passwordError.value = t('setup.passwordMismatch')
+-    return
+-  }
+-
+-  passwordSaving.value = true
+-  try {
+-    await authApi.changePassword(currentPassword.value, newPassword.value)
+-    currentPassword.value = ''
+-    newPassword.value = ''
+-    confirmPassword.value = ''
+-    passwordSaved.value = true
+-    setTimeout(() => {
+-      passwordSaved.value = false
+-    }, 2000)
+-  } catch (e) {
+-    passwordError.value = t('auth.invalidPassword')
+-  } finally {
+-    passwordSaving.value = false
+-  }
+-}
+-
+ async function saveConfig() {
+   loading.value = true
+   saved.value = false
+@@ -1645,28 +1546,6 @@ async function loadBackends() {
+   }
+ }
+ 
+-async function loadAuthConfig() {
+-  authConfigLoading.value = true
+-  try {
+-    authConfig.value = await configStore.refreshAuth()
+-  } catch {
+-  } finally {
+-    authConfigLoading.value = false
+-  }
+-}
+-
+-async function saveAuthConfig() {
+-  authConfigLoading.value = true
+-  try {
+-    authConfig.value = await configStore.updateAuth({
+-      single_user_allow_multiple_sessions: authConfig.value.single_user_allow_multiple_sessions,
+-    })
+-  } catch {
+-  } finally {
+-    authConfigLoading.value = false
+-  }
+-}
+-
+ async function loadExtensions() {
+   extensionsLoading.value = true
+   try {
+@@ -2283,18 +2162,10 @@ async function refreshUpdateStatus() {
+     if (updateSawRestarting.value && !updateAutoReloadTriggered.value) {
+       if (updateSawRequestFailure.value || updateStatus.value.phase === 'idle') {
+         updateAutoReloadTriggered.value = true
+-        router.replace('/login')
++        router.replace('/')
+       }
+     }
+-  } catch (e) {
+-    if (e instanceof ApiError && e.status === 401) {
+-      updateAutoReloadTriggered.value = true
+-      authStore.isAuthenticated = false
+-      authStore.user = null
+-      stopUpdatePolling()
+-      router.replace('/login')
+-      return
+-    }
++  } catch {
+     if (updateSawRestarting.value) {
+       updateSawRequestFailure.value = true
+     }
+@@ -2686,7 +2557,6 @@ onMounted(async () => {
+ 
+   await systemStore.fetchSystemInfo()
+   ensureVisibleSection()
+-  usernameInput.value = authStore.user || ''
+   await loadSectionData(activeSection.value)
+ 
+   if (updateRunning.value) {
+@@ -2877,90 +2747,6 @@ watch(isWindows, () => {
+             </Card>
+           </div>
+ 
+-          <!-- Account Section -->
+-          <div v-show="activeSection === 'account'" class="space-y-4">
+-            <Card>
+-              <CardHeader>
+-                <CardTitle>{{ t('settings.username') }}</CardTitle>
+-                <CardDescription>{{ t('settings.usernameDesc') }}</CardDescription>
+-              </CardHeader>
+-              <CardContent class="space-y-4">
+-                <div class="space-y-2">
+-                  <Label for="account-username">{{ t('settings.username') }}</Label>
+-                  <Input id="account-username" v-model="usernameInput" autocomplete="username" />
+-                </div>
+-                <div class="space-y-2">
+-                  <Label for="account-username-password">{{ t('settings.currentPassword') }}</Label>
+-                  <Input id="account-username-password" v-model="usernamePassword" type="password" autocomplete="current-password" />
+-                </div>
+-                <p v-if="usernameError" class="text-xs text-destructive">{{ usernameError }}</p>
+-                <p v-else-if="usernameSaved" class="flex items-center gap-1.5 text-xs text-success"><Check class="size-3.5" />{{ t('common.success') }}</p>
+-              </CardContent>
+-              <CardFooter class="border-t pt-4 justify-end">
+-                <Button @click="changeUsername" :disabled="usernameSaving">
+-                  <Loader2 v-if="usernameSaving" class="size-4 mr-2 animate-spin" />
+-                  <Save v-else class="size-4 mr-2" />
+-                  {{ t('common.save') }}
+-                </Button>
+-              </CardFooter>
+-            </Card>
+-
+-            <Card>
+-              <CardHeader>
+-                <CardTitle>{{ t('settings.changePassword') }}</CardTitle>
+-                <CardDescription>{{ t('settings.passwordDesc') }}</CardDescription>
+-              </CardHeader>
+-              <CardContent class="space-y-4">
+-                <div class="space-y-2">
+-                  <Label for="account-current-password">{{ t('settings.currentPassword') }}</Label>
+-                  <Input id="account-current-password" v-model="currentPassword" type="password" autocomplete="current-password" />
+-                </div>
+-                <div class="space-y-2">
+-                  <Label for="account-new-password">{{ t('settings.newPassword') }}</Label>
+-                  <Input id="account-new-password" v-model="newPassword" type="password" autocomplete="new-password" />
+-                </div>
+-                <div class="space-y-2">
+-                  <Label for="account-confirm-password">{{ t('auth.confirmPassword') }}</Label>
+-                  <Input id="account-confirm-password" v-model="confirmPassword" type="password" autocomplete="new-password" />
+-                </div>
+-                <p v-if="passwordError" class="text-xs text-destructive">{{ passwordError }}</p>
+-                <p v-else-if="passwordSaved" class="flex items-center gap-1.5 text-xs text-success"><Check class="size-3.5" />{{ t('common.success') }}</p>
+-              </CardContent>
+-              <CardFooter class="border-t pt-4 justify-end">
+-                <Button @click="changePassword" :disabled="passwordSaving">
+-                  <Loader2 v-if="passwordSaving" class="size-4 mr-2 animate-spin" />
+-                  <Save v-else class="size-4 mr-2" />
+-                  {{ t('common.save') }}
+-                </Button>
+-              </CardFooter>
+-            </Card>
+-
+-            <TotpSettingsCard />
+-
+-            <Card>
+-              <CardHeader>
+-                <CardTitle>{{ t('settings.authSettings') }}</CardTitle>
+-                <CardDescription>{{ t('settings.authSettingsDesc') }}</CardDescription>
+-              </CardHeader>
+-              <CardContent class="space-y-4">
+-                <div class="flex items-start justify-between gap-4">
+-                  <Label>{{ t('settings.allowMultipleSessions') }}</Label>
+-                  <Switch
+-                    v-model="authConfig.single_user_allow_multiple_sessions"
+-                    :disabled="authConfigLoading"
+-                  />
+-                </div>
+-              </CardContent>
+-              <CardFooter class="border-t pt-4 justify-end">
+-                <Button @click="saveAuthConfig" :disabled="authConfigLoading">
+-                  <Loader2 v-if="authConfigLoading" class="size-4 mr-2 animate-spin" />
+-                  <Save v-else class="size-4 mr-2" />
+-                  {{ t('common.save') }}
+-                </Button>
+-              </CardFooter>
+-            </Card>
+-          </div>
+-
+           <!-- Video Section -->
+           <div v-show="activeSection === 'video'" class="space-y-4">
+             <!-- Video Device Settings -->
+diff --git a/web/src/views/SetupView.vue b/web/src/views/SetupView.vue
+index e5ed58b..2036b34 100644
+--- a/web/src/views/SetupView.vue
++++ b/web/src/views/SetupView.vue
+@@ -5,7 +5,7 @@ import { selectionFrom } from '@/lib/hidGuide'
+ import { ref, computed, onMounted, watch, onUnmounted } from 'vue'
+ import { useRouter } from 'vue-router'
+ import { useI18n } from 'vue-i18n'
+-import { useAuthStore } from '@/stores/auth'
++import { useSetupStore } from '@/stores/setup'
+ import { configApi, streamApi, type DeviceList, type EncoderBackendInfo, type PlatformCapabilities } from '@/api'
+ import { toConfigFps } from '@/lib/fps'
+ import { formatVideoDeviceLabel } from '@/lib/video-device-label'
+@@ -14,7 +14,6 @@ import VideoInputFields from '@/components/VideoInputFields.vue'
+ import LanguageToggleButton from '@/components/LanguageToggleButton.vue'
+ import BrandMark from '@/components/BrandMark.vue'
+ import { Button } from '@/components/ui/button'
+-import { Input } from '@/components/ui/input'
+ import { Label } from '@/components/ui/label'
+ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+ import {
+@@ -33,11 +32,8 @@ import { Switch } from '@/components/ui/switch'
+ import { Stepper, StepperItem, StepperSeparator, StepperTitle, StepperTrigger } from '@/components/ui/stepper'
+ import { Alert, AlertDescription } from '@/components/ui/alert'
+ import {
+-  Eye,
+-  EyeOff,
+   ChevronRight,
+   ChevronLeft,
+-  User,
+   Video,
+   Keyboard,
+   Check,
+@@ -48,25 +44,13 @@ import {
+ 
+ const { t } = useI18n()
+ const router = useRouter()
+-const authStore = useAuthStore()
++const setupStore = useSetupStore()
+ 
+ const step = ref(1)
+ const loading = ref(false)
+ const error = ref('')
+ const slideDirection = ref<'forward' | 'backward'>('forward')
+ 
+-const username = ref('')
+-const password = ref('')
+-const confirmPassword = ref('')
+-const showPassword = ref(false)
+-
+-const usernameError = ref('')
+-const passwordError = ref('')
+-const confirmPasswordError = ref('')
+-const usernameTouched = ref(false)
+-const passwordTouched = ref(false)
+-const confirmPasswordTouched = ref(false)
+-
+ const videoDevice = ref('')
+ const videoFormat = ref('')
+ const videoResolution = ref('')
+@@ -77,7 +61,7 @@ const audioEnabled = ref(true)
+ const platform = ref<PlatformCapabilities | null>(null)
+ const isWindows = computed(() => platform.value?.mode === 'windows')
+ const audioSupported = computed(() => platform.value?.audio.available ?? true)
+-const totalSteps = 4
++const totalSteps = 3
+ const EMPTY_SELECT_VALUE = '__one-kvm-empty-select-value__'
+ 
+ const hidSelection = ref(selectionFrom())
+@@ -102,34 +86,6 @@ const devices = ref<DeviceList>({
+   },
+ })
+ 
+-const passwordStrength = computed(() => {
+-  const pwd = password.value
+-  if (!pwd) return 0
+-  let score = 0
+-  if (pwd.length >= 4) score++
+-  if (pwd.length >= 8) score++
+-  if (/[A-Z]/.test(pwd) && /[a-z]/.test(pwd)) score++
+-  if (/[0-9]/.test(pwd)) score++
+-  if (/[^A-Za-z0-9]/.test(pwd)) score++
+-  return Math.min(score, 4)
+-})
+-
+-const passwordStrengthText = computed(() => {
+-  const levels = [
+-    '',
+-    t('setup.passwordWeak'),
+-    t('setup.passwordMedium'),
+-    t('setup.passwordStrong'),
+-    t('setup.passwordVeryStrong'),
+-  ]
+-  return levels[passwordStrength.value] || ''
+-})
+-
+-const passwordStrengthColor = computed(() => {
+-  const colors = ['bg-muted', 'bg-destructive', 'bg-warning', 'bg-warning', 'bg-success']
+-  return colors[passwordStrength.value] || colors[0]
+-})
+-
+ const videoConfiguration = useVideoDeviceConfiguration({
+   devices: computed(() => devices.value.video),
+   selection: {
+@@ -138,7 +94,7 @@ const videoConfiguration = useVideoDeviceConfiguration({
+     resolution: videoResolution,
+     fps: videoFps,
+   },
+-  active: computed(() => step.value === 2),
++  active: computed(() => step.value === 1),
+   preferredFormat: device =>
+     device.formats.find(format => format.format.toUpperCase().includes('MJPEG'))?.format,
+ })
+@@ -153,48 +109,11 @@ const {
+ } = videoConfiguration
+ 
+ const stepLabels = computed(() => [
+-  t('setup.stepAccount'),
+   t('setup.stepAudioVideo'),
+   t('setup.stepHid'),
+   t('setup.stepExtensions'),
+ ])
+ 
+-function validateUsername() {
+-  usernameTouched.value = true
+-  if (username.value.length === 0) {
+-    usernameError.value = ''
+-  } else if (username.value.length < 2) {
+-    usernameError.value = t('setup.usernameHint')
+-  } else {
+-    usernameError.value = ''
+-  }
+-}
+-
+-function validatePassword() {
+-  passwordTouched.value = true
+-  if (password.value.length === 0) {
+-    passwordError.value = ''
+-  } else if (password.value.length < 4) {
+-    passwordError.value = t('setup.passwordHint')
+-  } else {
+-    passwordError.value = ''
+-  }
+-  if (confirmPasswordTouched.value) {
+-    validateConfirmPassword()
+-  }
+-}
+-
+-function validateConfirmPassword() {
+-  confirmPasswordTouched.value = true
+-  if (confirmPassword.value.length === 0) {
+-    confirmPasswordError.value = ''
+-  } else if (confirmPassword.value !== password.value) {
+-    confirmPasswordError.value = t('setup.passwordMismatch')
+-  } else {
+-    confirmPasswordError.value = ''
+-  }
+-}
+-
+ // Match audio to the selected capture device's USB bus.
+ watch(videoDevice, (newDevice) => {
+   // Auto-select matching audio device based on USB bus
+@@ -222,7 +141,7 @@ watch(videoDevice, (newDevice) => {
+ 
+ onMounted(async () => {
+   try {
+-    const status = await authStore.checkSetupStatus()
++    const status = await setupStore.checkSetupStatus()
+     platform.value = status.platform
+     if (!audioSupported.value) {
+       audioEnabled.value = false
+@@ -286,26 +205,6 @@ function handleKeyDown(e: KeyboardEvent) {
+   }
+ }
+ 
+-function validateStep1(): boolean {
+-  validateUsername()
+-  validatePassword()
+-  validateConfirmPassword()
+-
+-  if (username.value.length < 2) {
+-    error.value = t('setup.usernameHint')
+-    return false
+-  }
+-  if (password.value.length < 4) {
+-    error.value = t('setup.passwordHint')
+-    return false
+-  }
+-  if (password.value !== confirmPassword.value) {
+-    error.value = t('setup.passwordMismatch')
+-    return false
+-  }
+-  return true
+-}
+-
+ function validateStep2(): boolean {
+   // Video settings are optional, but if device is selected, format should be too
+   if (videoDevice.value && !isSourceFollowing.value && !videoFormat.value) {
+@@ -326,9 +225,8 @@ function validateStep3(): boolean {
+ function nextStep() {
+   error.value = ''
+ 
+-  if (step.value === 1 && !validateStep1()) return
+-  if (step.value === 2 && !validateStep2()) return
+-  if (step.value === 3 && !validateStep3()) return
++  if (step.value === 1 && !validateStep2()) return
++  if (step.value === 2 && !validateStep3()) return
+ 
+   if (step.value < totalSteps) {
+     slideDirection.value = 'forward'
+@@ -352,10 +250,10 @@ async function handleSetup() {
+   loading.value = true
+   // Reconcile a previous timed-out account request before submitting again.
+   try {
+-    const status = await authStore.checkSetupStatus()
++    const status = await setupStore.checkSetupStatus()
+     if (status.initialized) {
+       loading.value = false
+-      await router.push('/login')
++      await router.push('/')
+       return
+     }
+   } catch (e) {
+@@ -366,10 +264,7 @@ async function handleSetup() {
+ 
+   const [width, height] = (videoResolution.value || '').split('x').map(Number)
+ 
+-  const setupData: Parameters<typeof authStore.setup>[0] = {
+-    username: username.value,
+-    password: password.value,
+-  }
++  const setupData: Parameters<typeof setupStore.setup>[0] = {}
+ 
+   if (videoDevice.value) {
+     setupData.video_device = videoDevice.value
+@@ -408,19 +303,18 @@ async function handleSetup() {
+ 
+   setupData.ttyd_enabled = ttydEnabled.value
+ 
+-  const success = await authStore.setup(setupData)
++  const success = await setupStore.setup(setupData)
+ 
+   if (success) {
+-    const loggedIn = await authStore.login(username.value, password.value)
+-    router.push(loggedIn ? '/' : '/login')
++    await router.push('/')
+   } else {
+-    error.value = authStore.error || t('setup.setupFailed')
++    error.value = setupStore.error || t('setup.setupFailed')
+   }
+ 
+   loading.value = false
+ }
+ 
+-const stepIcons = [User, Video, Keyboard, Puzzle]
++const stepIcons = [Video, Keyboard, Puzzle]
+ </script>
+ 
+ <template>
+@@ -478,99 +372,8 @@ const stepIcons = [User, Video, Keyboard, Puzzle]
+ 
+         <!-- Step Content with Animation -->
+         <Transition :name="slideDirection === 'forward' ? 'slide-forward' : 'slide-backward'" mode="out-in">
+-          <!-- Step 1: Account Setup -->
++          <!-- Step 1: Audio/Video Settings -->
+           <div v-if="step === 1" key="step1" class="space-y-4">
+-            <h3 class="text-lg font-medium text-center">{{ t('setup.stepAccount') }}</h3>
+-
+-            <div class="space-y-2">
+-              <Label for="username" :class="{ 'text-destructive': usernameError }">
+-                {{ t('setup.setUsername') }}
+-              </Label>
+-              <div class="relative">
+-                <User
+-                  class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground"
+-                />
+-                <Input
+-                  id="username"
+-                  v-model="username"
+-                  type="text"
+-                  autocomplete="username"
+-                  :placeholder="t('setup.usernameHint')"
+-                  class="pl-10"
+-                  :class="{ 'border-destructive focus-visible:ring-destructive': usernameError }"
+-                  @blur="validateUsername"
+-                  @input="usernameTouched && validateUsername()"
+-                />
+-              </div>
+-              <p v-if="usernameError" class="text-xs text-destructive">{{ usernameError }}</p>
+-            </div>
+-
+-            <div class="space-y-2">
+-              <Label for="password" :class="{ 'text-destructive': passwordError }">
+-                {{ t('setup.setPassword') }}
+-              </Label>
+-              <div class="relative">
+-                <Input
+-                  id="password"
+-                  v-model="password"
+-                  :type="showPassword ? 'text' : 'password'"
+-                  autocomplete="new-password"
+-                  :placeholder="t('setup.passwordHint')"
+-                  class="pr-10"
+-                  :class="{ 'border-destructive focus-visible:ring-destructive': passwordError }"
+-                  @blur="validatePassword"
+-                  @input="passwordTouched && validatePassword()"
+-                />
+-                <Button
+-                  type="button"
+-                  variant="ghost"
+-                  size="icon-sm"
+-                  class="absolute right-1 top-1/2 -translate-y-1/2 text-muted-foreground"
+-                  :aria-label="showPassword ? t('extensions.rustdesk.hidePassword') : t('extensions.rustdesk.showPassword')"
+-                  @click="showPassword = !showPassword"
+-                >
+-                  <Eye v-if="!showPassword" class="w-4 h-4" />
+-                  <EyeOff v-else class="w-4 h-4" />
+-                </Button>
+-              </div>
+-              <p v-if="passwordError" class="text-xs text-destructive">{{ passwordError }}</p>
+-
+-              <!-- Password Strength Indicator -->
+-              <div v-if="password.length > 0" class="space-y-1">
+-                <div class="flex gap-1 h-1">
+-                  <div
+-                    v-for="i in 4"
+-                    :key="i"
+-                    class="flex-1 rounded-full transition-colors duration-300"
+-                    :class="i <= passwordStrength ? passwordStrengthColor : 'bg-muted'"
+-                  />
+-                </div>
+-                <p class="text-xs text-muted-foreground">
+-                  {{ t('setup.passwordStrength') }}: {{ passwordStrengthText }}
+-                </p>
+-              </div>
+-            </div>
+-
+-            <div class="space-y-2">
+-              <Label for="confirmPassword" :class="{ 'text-destructive': confirmPasswordError }">
+-                {{ t('setup.confirmPassword') }}
+-              </Label>
+-              <Input
+-                id="confirmPassword"
+-                v-model="confirmPassword"
+-                :type="showPassword ? 'text' : 'password'"
+-                autocomplete="new-password"
+-                :placeholder="t('setup.confirmPassword')"
+-                :class="{ 'border-destructive focus-visible:ring-destructive': confirmPasswordError }"
+-                @blur="validateConfirmPassword"
+-                @input="confirmPasswordTouched && validateConfirmPassword()"
+-              />
+-              <p v-if="confirmPasswordError" class="text-xs text-destructive">{{ confirmPasswordError }}</p>
+-            </div>
+-          </div>
+-
+-          <!-- Step 2: Audio/Video Settings -->
+-          <div v-else-if="step === 2" key="step2" class="space-y-4">
+             <h3 class="text-lg font-medium text-center">{{ t('setup.stepAudioVideo') }}</h3>
+ 
+             <div class="space-y-2">
+@@ -695,15 +498,15 @@ const stepIcons = [User, Video, Keyboard, Puzzle]
+             </div>
+           </div>
+ 
+-          <!-- Step 3: HID Settings -->
+-          <div v-else-if="step === 3" key="step3" class="space-y-4">
++          <!-- Step 2: HID Settings -->
++          <div v-else-if="step === 2" key="step2" class="space-y-4">
+             <h3 class="text-lg font-medium text-center">{{ t('setup.stepHid') }}</h3>
+ 
+             <HidDriverForm v-model="hidSelection" @valid="hidSelectionValid = $event" />
+           </div>
+ 
+-          <!-- Step 4: Extensions Settings -->
+-          <div v-else-if="step === 4" key="step4" class="space-y-4">
++          <!-- Step 3: Extensions Settings -->
++          <div v-else-if="step === 3" key="step3" class="space-y-4">
+             <h3 class="text-lg font-medium text-center">{{ t('setup.stepExtensions') }}</h3>
+             <p class="text-sm text-muted-foreground text-center">
+               {{ t('setup.extensionsDescription') }}
+@@ -746,8 +549,8 @@ const stepIcons = [User, Video, Keyboard, Puzzle]
+             {{ t('common.back') }}
+           </Button>
+ 
+-          <Button v-if="step < totalSteps" class="flex-1" :disabled="step === 3 && !hidSelectionValid" @click="nextStep">
+-            {{ t(step === 3 ? 'hidGuide.useConfiguration' : 'common.next') }}
++          <Button v-if="step < totalSteps" class="flex-1" :disabled="step === 2 && !hidSelectionValid" @click="nextStep">
++            {{ t(step === 2 ? 'hidGuide.useConfiguration' : 'common.next') }}
+             <ChevronRight class="w-4 h-4 ml-2" />
+           </Button>
+ 

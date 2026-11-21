@@ -16,7 +16,16 @@ omitted API fields preserve their values. Server errors remain errors.
 Device-password verification, signing keys and UUID are preserved.
 
 The build never embeds deployment credentials, Keys or databases.
-Use the authenticated settings page after installation.
+The default Web HTTP port is 80. An existing persisted port of 8080 is
+migrated to 80 on first startup; explicitly configured non-default ports are
+preserved. Web account routes and the Web authentication middleware are
+removed. Existing user rows remain in the database but are not used by the Web
+UI.
+This custom build removes the One-KVM Web account login boundary. The Web UI
+is exposed without authentication and must only be deployed on a trusted LAN,
+never directly to the Internet. It exposes video, HID, ATX, MSD and terminal
+capabilities to anyone who can reach the port. Redfish, RTSP and VNC
+authentication are independent and remain enabled.
 No secure_tcp bypass or artificial registration success is introduced.
 
 ## Build
