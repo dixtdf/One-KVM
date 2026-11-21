@@ -324,3 +324,37 @@ U 157.6、V 118.5，U/V标准差28.6/12.3，与源帧一致；日志显示
   不要求账户字段。前端 `vue-tsc` 与 `vite build` 已通过（2777 modules）。
 - 本机没有 Rust 工具链，后端编译和 ARM64 DEB 仍以固定上游的 Actions 构建为准。
   当前尚未把“前端构建通过”写成后端或实机验证成功。
+
+### 构建、部署与 OTG 实测结论
+
+- Actions `44887225781`（提交 `cd066aa`）成功。ZIP SHA256
+  `650996f9c893df3ebec779921f6071acedead5ba0dad8719040b92dbc182e4e5`；
+  ARM64 DEB `one-kvm_0.2.8+custom.3.platform.3_arm64.deb` SHA256
+  `d7cf01b1039e67988c38ffb27235921b1570b739156bffe100d320904997b1cc`。
+- 已安装到 `10.10.10.18`。升级前备份在 `/root/one-kvm-web-noauth-20261121/`，
+  含数据库备份、旧二进制、旧 drop-in、新 DEB、SHA256 清单和 `rollback.sh`。
+  旧中文前端认证 override `30-manual-id-frontend.conf` 已移到备份目录并禁用。
+- 只重启了 `one-kvm` 服务，没有重启 Pi。服务监听 `0.0.0.0:80`，原 `8080`
+  已关闭；数据库中的 `web.http_port` 已迁移为 `80`。无 Cookie 请求
+  `/`、`/api/info`、`/api/hid/status`、`/api/hid/otg/self-check`、
+  `/api/config` 均返回 200；`/api/auth/login` 和 `/api/config/auth` 返回 404。
+- `10.10.10.18` 的 OTG 自检为 `overall_ok=true`、`bound_udc=fe980000.usb`、
+  `udc_state=configured`、`udc_speed=high-speed`；`/api/hid/status` 为
+  `available=true/initialized=true/online=true`，`/dev/hidg0` 至 `/dev/hidg2`
+  由服务进程持有。
+- `10.10.10.2` 主机侧已枚举 `1d6b:0104 One-KVM USB Device`，包含键盘、相对鼠标、
+  绝对鼠标三个 HID 接口；QEMU 命令行也保留 `usb-host` 的 `hostdev2` 映射。
+  但这只能证明 Linux 主机侧和 QEMU 配置存在，不能证明 guest 内输入生效。
+- 当前无法确认 guest 识别设备。服务重启时物理 USB 从主机 Device 126 重新枚举为
+  Device 3，QEMU 监控仍显示旧 `/dev/bus/usb/001/126`，日志在同一时刻出现
+  `libusb_release_interface: -4 [NO_DEVICE]`；通过 QGA 只读检查，guest 的 IORegistry
+  只有 QEMU xHCI 控制器，没有 `IOUSBHostDevice`。因此当前直通绑定是陈旧的，guest
+  尚未重新拿到 One-KVM 设备。
+- 本次没有向 guest 发送任何键鼠、ATX、MSD 或配置写入，也没有重启或修改 `.2`/VM。
+  要恢复当前直通，需要在 `.2` 上重新 detach/attach `hostdev2`（或按 Unraid 的 USB
+  直通方式重新选择设备），该操作超出本次只读授权。仅重启 `.18` 会再次触发 USB
+  重新枚举，不能可靠修复已经指向旧设备号的 QEMU `usb-host` 绑定，不能作为验收方案。
+- 登录移除与端口 80 必须使用新二进制/DEB，旧数据库或重启 Pi 都不会产生该行为。
+  OTG 的长期稳定性仍与“服务重启会重建 gadget”有关；若后续要求避免每次升级都让
+  guest 丢失 USB 绑定，需要另做“复用已存在 gadget/减少重枚举”或带退避的恢复补丁，
+  并单独实机验证，不能把一次服务重启后的 `configured` 当作根因已修复。
