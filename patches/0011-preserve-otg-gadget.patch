@@ -1,0 +1,303 @@
+diff --git a/src/otg/manager.rs b/src/otg/manager.rs
+index 8bf4899..90bfe6a 100644
+--- a/src/otg/manager.rs
++++ b/src/otg/manager.rs
+@@ -1,5 +1,5 @@
+ use std::fs;
+-use std::path::PathBuf;
++use std::path::{Path, PathBuf};
+ use tracing::{debug, error, info, warn};
+ 
+ use super::configfs::{
+@@ -51,6 +51,8 @@ pub struct OtgGadgetManager {
+     functions: Vec<Box<dyn GadgetFunction>>,
+     bound_udc: Option<String>,
+     created_by_us: bool,
++    preserve_existing: bool,
++    expected_udc: Option<String>,
+ }
+ 
+ impl OtgGadgetManager {
+@@ -78,9 +80,24 @@ impl OtgGadgetManager {
+             functions: Vec::with_capacity(4),
+             bound_udc: None,
+             created_by_us: false,
++            preserve_existing: true,
++            expected_udc: None,
+         }
+     }
+ 
++    pub fn preserve_existing(&mut self) -> &mut Self {
++        self.preserve_existing = true;
++        self
++    }
++
++    /// Preserve an already-bound gadget only when it is attached to the UDC
++    /// expected by the current configuration.
++    pub fn preserve_existing_udc(&mut self, udc: &str) -> &mut Self {
++        self.preserve_existing = true;
++        self.expected_udc = Some(udc.to_string());
++        self
++    }
++
+     pub fn is_available() -> bool {
+         is_configfs_available()
+     }
+@@ -179,8 +196,18 @@ impl OtgGadgetManager {
+ 
+         if self.gadget_exists() {
+             if self.is_bound() {
+-                debug!("Gadget already exists and is bound, skipping setup");
+-                return Ok(());
++                if self.preserve_existing && !self.created_by_us && self.existing_gadget_matches()? {
++                    info!("Adopting an existing bound OTG gadget without re-enumeration");
++                    self.created_by_us = false;
++                    return Ok(());
++                }
++                if self.preserve_existing && !self.created_by_us {
++                    warn!("Existing bound OTG gadget does not match the desired configuration");
++                    self.cleanup()?;
++                } else {
++                    debug!("Gadget already exists and is bound, skipping setup");
++                    return Ok(());
++                }
+             }
+             warn!("Gadget exists but not bound, will reconfigure");
+             self.cleanup()?;
+@@ -221,6 +248,22 @@ impl OtgGadgetManager {
+     }
+ 
+     pub fn bind(&mut self, udc: &str) -> Result<()> {
++        if self.preserve_existing && !self.created_by_us {
++            let current_udc = self.current_udc();
++            if current_udc.as_deref() != Some(udc) {
++                warn!(
++                    "Existing OTG gadget is bound to {:?}, not the requested {udc}",
++                    current_udc
++                );
++                return Err(AppError::Config(
++                    "Existing OTG gadget is bound to an incompatible UDC".to_string(),
++                ));
++            }
++            self.bound_udc = Some(udc.to_string());
++            debug!("Adopted existing OTG gadget already bound to UDC: {udc}");
++            return Ok(());
++        }
++
+         self.recreate_config_links()?;
+ 
+         debug!("Binding gadget to UDC: {}", udc);
+@@ -377,6 +420,76 @@ impl OtgGadgetManager {
+         &self.gadget_path
+     }
+ 
++    fn current_udc(&self) -> Option<String> {
++        fs::read_to_string(self.gadget_path.join("UDC"))
++            .ok()
++            .map(|value| value.trim().to_string())
++            .filter(|value| !value.is_empty())
++    }
++
++    fn read_attribute(path: &Path) -> String {
++        fs::read_to_string(path)
++            .unwrap_or_default()
++            .trim()
++            .to_string()
++    }
++
++    /// Check that an already-bound ConfigFS gadget is safe to adopt. This avoids
++    /// recreating a healthy device, which would cause the USB host to disconnect
++    /// and assign a new device number to the running virtual machine.
++    fn existing_gadget_matches(&self) -> Result<bool> {
++        let descriptor_matches = [
++            ("idVendor", format!("0x{:04x}", self.descriptor.vendor_id)),
++            ("idProduct", format!("0x{:04x}", self.descriptor.product_id)),
++            ("bcdDevice", format!("0x{:04x}", self.descriptor.device_version)),
++        ]
++        .into_iter()
++        .all(|(attribute, expected)| {
++            read_attribute(&self.gadget_path.join(attribute)) == expected
++        });
++        if !descriptor_matches {
++            return Ok(false);
++        }
++
++        let strings_path = self.gadget_path.join("strings/0x409");
++        let strings_match = [
++            ("serialnumber", self.descriptor.serial_number.as_str()),
++            ("manufacturer", self.descriptor.manufacturer.as_str()),
++            ("product", self.descriptor.product.as_str()),
++        ]
++        .into_iter()
++        .all(|(attribute, expected)| {
++            read_attribute(&strings_path.join(attribute)) == expected
++        });
++        if !strings_match {
++            return Ok(false);
++        }
++
++        for func in &self.functions {
++            if !self.gadget_path.join("functions").join(func.name()).is_dir() {
++                return Ok(false);
++            }
++            if self.config_path.join(func.name()).symlink_metadata().is_err() {
++                return Ok(false);
++            }
++        }
++
++        match self.expected_udc.as_deref() {
++            Some(expected) => self.current_udc().as_deref() == Some(expected),
++            None => true,
++        }
++    }
++
++    /// Leave the ConfigFS tree in place and stop claiming ownership. The UDC
++    /// binding and all function directories remain, so the USB host sees the
++    /// same device after a service restart instead of a physical re-enumeration.
++    pub fn relinquish(&mut self) -> Result<()> {
++        self.bound_udc = None;
++        self.created_by_us = false;
++        info!("Released OTG gadget ownership without unbinding or deleting ConfigFS state");
++        Ok(())
++    }
++
+     fn recreate_config_links(&self) -> Result<()> {
+         let functions_path = self.gadget_path.join("functions");
+         if !functions_path.exists() || !self.config_path.exists() {
+@@ -413,6 +526,9 @@ impl Default for OtgGadgetManager {
+ 
+ impl Drop for OtgGadgetManager {
+     fn drop(&mut self) {
++        // Leaving a bound gadget behind preserves the live USB endpoint and the
++        // host-side device number. Only resources created by this manager are
++        // deleted, so restarting the service cannot force a physical re-enumeration.
+         if self.created_by_us {
+             if let Err(e) = self.cleanup() {
+                 error!("Failed to cleanup OTG gadget on drop: {}", e);
+@@ -534,6 +650,92 @@ mod tests {
+         assert!(!manager.gadget_exists());
+     }
+ 
++    fn prepare_matching_gadget(manager: &mut OtgGadgetManager) -> tempfile::TempDir {
++        let temp = tempfile::tempdir().unwrap();
++        let base = temp.path();
++        manager.gadget_path = base.join("one-kvm");
++        manager.config_path = manager.gadget_path.join("configs/c.1");
++        fs::create_dir_all(manager.gadget_path.join("functions/hid.usb0")).unwrap();
++        fs::create_dir_all(manager.config_path).unwrap();
++        fs::write(manager.gadget_path.join("idVendor"), "0x1d6b
++").unwrap();
++        fs::write(manager.gadget_path.join("idProduct"), "0x0104
++").unwrap();
++        fs::write(manager.gadget_path.join("bcdDevice"), "0x0100
++").unwrap();
++        fs::create_dir_all(manager.gadget_path.join("strings/0x409")).unwrap();
++        fs::write(manager.gadget_path.join("strings/0x409/serialnumber"), "0123456789
++").unwrap();
++        fs::write(manager.gadget_path.join("strings/0x409/manufacturer"), "One-KVM
++").unwrap();
++        fs::write(manager.gadget_path.join("strings/0x409/product"), "One-KVM USB Device
++").unwrap();
++        manager.add_keyboard(false).unwrap();
++        std::os::unix::fs::symlink(
++            manager.gadget_path.join("functions/hid.usb0"),
++            manager.config_path.join("hid.usb0"),
++        )
++        .unwrap();
++        fs::write(manager.gadget_path.join("UDC"), "test-udc
++").unwrap();
++        temp
++    }
++
++    #[test]
++    fn matching_bound_gadget_is_adopted_without_rebinding() {
++        let mut manager = OtgGadgetManager::new();
++        manager.preserve_existing();
++        let _keep = prepare_matching_gadget(&mut manager);
++        let gadget_path = manager.gadget_path.clone();
++        manager.preserve_existing_udc("test-udc");
++
++        assert!(manager.existing_gadget_matches().unwrap());
++        assert!(manager.bind("test-udc").is_err());
++        assert_eq!(
++            fs::read_to_string(gadget_path.join("UDC")).unwrap().trim(),
++            "test-udc"
++        );
++    }
++
++    #[test]
++    fn descriptor_mismatch_is_detected() {
++        let mut manager = OtgGadgetManager::new();
++        manager.preserve_existing();
++        let _keep = prepare_matching_gadget(&mut manager);
++        fs::write(manager.gadget_path.join("idProduct"), "0x9999
++").unwrap();
++
++        assert!(!manager.existing_gadget_matches().unwrap());
++    }
++
++    #[test]
++    fn missing_function_is_detected() {
++        let mut manager = OtgGadgetManager::new();
++        manager.preserve_existing();
++        let _keep = prepare_matching_gadget(&mut manager);
++        fs::remove_dir(manager.gadget_path.join("functions/hid.usb0")).unwrap();
++
++        assert!(!manager.existing_gadget_matches().unwrap());
++    }
++
++    #[test]
++    fn relinquish_keeps_gadget_and_udc_bound() {
++        let mut manager = OtgGadgetManager::new();
++        manager.preserve_existing();
++        let _keep = prepare_matching_gadget(&mut manager);
++
++        manager.preserve_existing_udc("test-udc");
++        manager.bind("test-udc").unwrap();
++        manager.relinquish().unwrap();
++        manager.bind("test-udc").unwrap();
++
++        assert!(!manager.created_by_us);
++        assert_eq!(
++            fs::read_to_string(manager.gadget_path.join("UDC")).unwrap().trim(),
++            "test-udc"
++        );
++    }
++
+     #[test]
+     fn test_function_selection_is_not_prevalidated() {
+         let mut manager = OtgGadgetManager::with_config("test");
+diff --git a/src/otg/service.rs b/src/otg/service.rs
+index 91321ba..b150f9b 100644
+--- a/src/otg/service.rs
++++ b/src/otg/service.rs
+@@ -467,10 +467,15 @@ impl OtgService {
+             AppError::Internal(error)
+         })?;
+ 
++        let udc = desired.udc.clone().ok_or_else(|| {
++            let error = "OTG not available: no UDC found".to_string();
++            AppError::Internal(error)
++        })?;
+         let mut manager = OtgGadgetManager::with_descriptor(
+             super::configfs::DEFAULT_GADGET_NAME,
+             desired.descriptor.clone(),
+-        );
++        )
++        .preserve_existing_udc(&udc);
+ 
+         let mut hid_paths = None;
+         // Add UAC BEFORE HID so the isochronous endpoint gets a
+@@ -667,9 +672,9 @@ impl OtgService {
+ 
+         let mut manager = self.manager.lock().await;
+         if let Some(m) = manager.as_mut() {
+-            m.cleanup().map_err(|e| {
+-                AppError::Internal(format!("Failed to clean up gadget during shutdown: {e}"))
+-            })?;
++            if let Err(e) = m.relinquish() {
++                warn!("Failed to release OTG gadget ownership during shutdown: {e}");
++            }
+         }
+         manager.take();
+ 

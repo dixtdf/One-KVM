@@ -362,3 +362,21 @@ U 157.6、V 118.5，U/V标准差28.6/12.3，与源帧一致；日志显示
   OTG 的长期稳定性仍与“服务重启会重建 gadget”有关；若后续要求避免每次升级都让
   guest 丢失 USB 绑定，需要另做“复用已存在 gadget/减少重枚举”或带退避的恢复补丁，
   并单独实机验证，不能把一次服务重启后的 `configured` 当作根因已修复。
+## 2026-11-21：保留已绑定 OTG gadget 并固化 ARM64 构建
+
+补丁 `0011-preserve-otg-gadget.patch` 针对服务重启造成 USB 物理重枚举、
+进而使 `10.10.10.2` 上运行中的 QEMU 仍指向旧 `/dev/bus/usb/001/126` 的问题：
+
+- `OtgGadgetManager` 在绑定前记录期望 UDC，并校验已有 gadget 的
+  `idVendor/idProduct/bcdDevice`、字符串描述符、全部函数目录及配置链接。
+- 校验通过且 UDC 匹配时直接接管已有 gadget，不重写 UDC、不删除并重建
+  ConfigFS，避免 USB 设备号变化。
+- descriptor、函数、链接或 UDC 不匹配时仍执行原有清理并重新创建，防止把
+  不可用或配置冲突的旧 gadget误当作健康设备。
+- `OtgService::shutdown` 改为 `relinquish`，只停止进程所有权，保留 UDC 绑定
+  和 ConfigFS 状态。
+- 新增文件系统级测试：匹配已有 gadget 的接管、descriptor/函数不匹配检测、
+  `relinquish` 后 UDC 仍保持。
+
+`pins.json` 构建版本提升为 `0.2.8+custom.3.platform.4`，补丁由
+`scripts/prepare.py` 按文件名顺序自动应用并进入 ARM64 DEB。
