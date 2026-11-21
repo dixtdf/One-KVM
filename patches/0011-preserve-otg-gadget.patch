@@ -268,7 +268,7 @@ index 8bf4899..77dedbd 100644
      fn test_function_selection_is_not_prevalidated() {
          let mut manager = OtgGadgetManager::with_config("test");
 diff --git a/src/otg/service.rs b/src/otg/service.rs
-index 91321ba..6925063 100644
+index 91321ba..fabd2f7 100644
 --- a/src/otg/service.rs
 +++ b/src/otg/service.rs
 @@ -466,11 +466,11 @@ impl OtgService {
@@ -279,9 +279,8 @@ index 91321ba..6925063 100644
          let mut manager = OtgGadgetManager::with_descriptor(
              super::configfs::DEFAULT_GADGET_NAME,
              desired.descriptor.clone(),
--        );
-+        )
-+        .preserve_existing_udc(&udc);
+         );
++        manager.preserve_existing_udc(&udc);
  
          let mut hid_paths = None;
          // Add UAC BEFORE HID so the isochronous endpoint gets a
