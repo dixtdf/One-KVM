@@ -1,5 +1,5 @@
 diff --git a/src/otg/manager.rs b/src/otg/manager.rs
-index 8bf4899..ed0e57b 100644
+index 8bf4899..86563e5 100644
 --- a/src/otg/manager.rs
 +++ b/src/otg/manager.rs
 @@ -1,5 +1,5 @@
@@ -145,10 +145,10 @@ index 8bf4899..ed0e57b 100644
 +            }
 +        }
 +
-+        match self.expected_udc.as_deref() {
++        Ok(match self.expected_udc.as_deref() {
 +            Some(expected) => self.current_udc().as_deref() == Some(expected),
 +            None => true,
-+        }
++        })
 +    }
 +
 +    /// Leave the ConfigFS tree in place and stop claiming ownership. The UDC
