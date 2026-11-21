@@ -380,3 +380,41 @@ U 157.6、V 118.5，U/V标准差28.6/12.3，与源帧一致；日志显示
 
 `pins.json` 构建版本提升为 `0.2.8+custom.3.platform.4`，补丁由
 `scripts/prepare.py` 按文件名顺序自动应用并进入 ARM64 DEB。
+
+## 2026-11-21：修复 0011 编译错误并实机验证 OTG 保留生效
+
+`0011` 首轮 CI（run `44909887928`）在“Build ARM64 using pinned Debian 12 image”
+步骤失败。CI job 日志需管理员权限无法读取，改用在 `10.10.10.18` 上对补丁后的
+ARM64 源码做原生 `cargo check` 复现，定位并修复了两处补丁代码错误：
+
+- `manager.rs` 中 `read_attribute` 是 `impl` 关联函数，闭包内必须以
+  `Self::read_attribute` 调用，原先裸函数名导致 `E0425`。
+- 测试辅助 `prepare_matching_gadget` 中 `fs::create_dir_all(manager.config_path)`
+  在 `&mut` 引用上会移动 `PathBuf`，改为传 `&manager.config_path`，消除 `E0507`。
+
+修复后 `cargo check` 与 `cargo check --tests` 均通过（仅剩与补丁无关的既有警告），
+补丁以提交 `aa270db` 合入 `main`。
+
+CI 重新构建 run `44924415304`（提交 `aa270db`）**全部 15 个步骤 success**，
+包含此前失败的步骤 12 Build ARM64，步骤 13 打包 DEB 成功。产物：
+`one-kvm_0.2.8+custom.3.platform.4_arm64.deb`，
+SHA256 `ef218bb4b9b91432f1d3eefedf54726a8c3391404d2e667c5e0f519f37da95a6`。
+
+部署到 `10.10.10.18`（仅重启 `one-kvm` 服务，未重启 Pi）后实机验证 OTG 保留：
+
+- 服务监听 `0.0.0.0:80`，`/api/info` 返回 200，版本升级为
+  `0.2.8+custom.3.platform.4 arm64`。
+- 使用 `platform.4` 二进制重启服务后，日志确认保留行为生效：
+  - 关闭时：`Released OTG gadget ownership without unbinding or deleting ConfigFS state`
+    （`OtgService::shutdown` 走 `relinquish`）。
+  - 启动时：`Adopting an existing bound OTG gadget without re-enumeration`。
+- UDC 仍为 `fe980000.usb`，state `configured`，`/dev/hidg0`、`/dev/hidg1`、
+  `/dev/hidg2` 存在并由服务持有，服务重启未触发 USB 物理重枚举。
+
+说明：从 `platform.3` 升级到 `platform.4` 的那次重启，由旧二进制执行关闭，
+仍走旧 `cleanup()` 路径（部署日志中可见 `Cleaning up`/`Unbound gadget`），
+因此那一次会重建 gadget；这是新旧二进制替换时的一次性行为。`platform.4`
+自身运行后的重启已实测为“保留 + 接管”，即本补丁目标行为成立。
+
+`10.10.10.2` 的 guest 侧 USB 直通恢复仍需在用户对该主机额外授权后执行
+USB hostdev 重新挂载或 VM 重启，本阶段未对 `.2` 做任何写操作。
