@@ -2546,7 +2546,7 @@ index 4ba82ca..0000000
 -  </div>
 -</template>
 diff --git a/web/src/views/SettingsView.vue b/web/src/views/SettingsView.vue
-index 9fa53a4..5569a2c 100644
+index 9fa53a4..48510be 100644
 --- a/web/src/views/SettingsView.vue
 +++ b/web/src/views/SettingsView.vue
 @@ -5,12 +5,9 @@ import { ref, computed, onMounted, watch, nextTick } from 'vue'
@@ -2653,6 +2653,15 @@ index 9fa53a4..5569a2c 100644
  
  const watchdogStatus = ref<WatchdogConfigResponse | null>(null)
  const watchdogLoading = ref(false)
+@@ -580,7 +552,7 @@ const vncStreamUrl = computed(() => {
+ })
+ 
+ const webServerConfig = ref<WebConfig>({
+-  http_port: 8080,
++  http_port: 80,
+   https_port: 8443,
+   bind_address: '0.0.0.0',
+   bind_addresses: ['0.0.0.0'],
 @@ -1339,13 +1311,6 @@ watch(
    { deep: true },
  )
@@ -2888,7 +2897,7 @@ index 9fa53a4..5569a2c 100644
            <div v-show="activeSection === 'video'" class="space-y-4">
              <!-- Video Device Settings -->
 diff --git a/web/src/views/SetupView.vue b/web/src/views/SetupView.vue
-index e5ed58b..2036b34 100644
+index e5ed58b..0ca6c8c 100644
 --- a/web/src/views/SetupView.vue
 +++ b/web/src/views/SetupView.vue
 @@ -5,7 +5,7 @@ import { selectionFrom } from '@/lib/hidGuide'
@@ -3097,9 +3106,12 @@ index e5ed58b..2036b34 100644
  
    if (step.value < totalSteps) {
      slideDirection.value = 'forward'
-@@ -352,10 +250,10 @@ async function handleSetup() {
+@@ -350,12 +248,12 @@ async function handleSetup() {
+   if (loading.value || !validateStep3()) return
+ 
    loading.value = true
-   // Reconcile a previous timed-out account request before submitting again.
+-  // Reconcile a previous timed-out account request before submitting again.
++  // Reconcile a previous timed-out setup request before submitting again.
    try {
 -    const status = await authStore.checkSetupStatus()
 +    const status = await setupStore.checkSetupStatus()
