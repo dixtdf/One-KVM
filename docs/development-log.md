@@ -345,15 +345,19 @@ U 157.6、V 118.5，U/V标准差28.6/12.3，与源帧一致；日志显示
 - `10.10.10.2` 主机侧已枚举 `1d6b:0104 One-KVM USB Device`，包含键盘、相对鼠标、
   绝对鼠标三个 HID 接口；QEMU 命令行也保留 `usb-host` 的 `hostdev2` 映射。
   但这只能证明 Linux 主机侧和 QEMU 配置存在，不能证明 guest 内输入生效。
-- 当前无法确认 guest 识别设备。服务重启时物理 USB 从主机 Device 126 重新枚举为
-  Device 3，QEMU 监控仍显示旧 `/dev/bus/usb/001/126`，日志在同一时刻出现
-  `libusb_release_interface: -4 [NO_DEVICE]`；通过 QGA 只读检查，guest 的 IORegistry
-  只有 QEMU xHCI 控制器，没有 `IOUSBHostDevice`。因此当前直通绑定是陈旧的，guest
-  尚未重新拿到 One-KVM 设备。
+- guest 侧历史日志证明部署前 USB 直通曾经生效：15:59:50 macOS 识别
+  `One-KVM USB Device`，`VendorID=7531`、`ProductID=260`，并创建键盘
+  `usage 6` 和绝对鼠标 `usage 2`。17:14:58 服务重启造成主机 USB 断开时，guest
+  同时记录 `hardware connection lost` 并移除该设备，之后没有再枚举。
+- 当前 guest 直通是陈旧的：主机设备号已从 126 重新枚举为 3，QEMU 监控仍保存
+  `/dev/bus/usb/001/126`，日志出现 `libusb_release_interface: -4 [NO_DEVICE]`；
+  QGA 只读检查的 IORegistry 只剩 QEMU xHCI 控制器，没有 `IOUSBHostDevice`。
+  因此能确认部署前 OTG 在本目标上工作过，但不能声称当前 guest 输入仍可用。
 - 本次没有向 guest 发送任何键鼠、ATX、MSD 或配置写入，也没有重启或修改 `.2`/VM。
-  要恢复当前直通，需要在 `.2` 上重新 detach/attach `hostdev2`（或按 Unraid 的 USB
-  直通方式重新选择设备），该操作超出本次只读授权。仅重启 `.18` 会再次触发 USB
-  重新枚举，不能可靠修复已经指向旧设备号的 QEMU `usb-host` 绑定，不能作为验收方案。
+  要恢复当前直通，需要在 `.2` 上重新 hotplug/detach-attach `hostdev2`，或重启
+  VM 让其重新按当前设备号打开；这些操作超出本次只读授权。仅重启 `.18` 只会再次
+  重枚举 USB，不能让已经运行且持有旧设备路径的 QEMU 自动重新接回，因此不能作为
+  当前故障的修复或验收方案。
 - 登录移除与端口 80 必须使用新二进制/DEB，旧数据库或重启 Pi 都不会产生该行为。
   OTG 的长期稳定性仍与“服务重启会重建 gadget”有关；若后续要求避免每次升级都让
   guest 丢失 USB 绑定，需要另做“复用已存在 gadget/减少重枚举”或带退避的恢复补丁，
