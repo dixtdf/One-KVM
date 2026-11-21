@@ -116,7 +116,7 @@ index 8bf4899..3a1a7f8 100644
 +        ]
 +        .into_iter()
 +        .all(|(attribute, expected)| {
-+            read_attribute(&self.gadget_path.join(attribute)) == expected
++            Self::read_attribute(&self.gadget_path.join(attribute)) == expected
 +        });
 +        if !descriptor_matches {
 +            return Ok(false);
@@ -130,7 +130,7 @@ index 8bf4899..3a1a7f8 100644
 +        ]
 +        .into_iter()
 +        .all(|(attribute, expected)| {
-+            read_attribute(&strings_path.join(attribute)) == expected
++            Self::read_attribute(&strings_path.join(attribute)) == expected
 +        });
 +        if !strings_match {
 +            return Ok(false);
@@ -183,7 +183,7 @@ index 8bf4899..3a1a7f8 100644
 +        manager.gadget_path = base.join("one-kvm");
 +        manager.config_path = manager.gadget_path.join("configs/c.1");
 +        fs::create_dir_all(manager.gadget_path.join("functions/hid.usb0")).unwrap();
-+        fs::create_dir_all(manager.config_path).unwrap();
++        fs::create_dir_all(&manager.config_path).unwrap();
 +        fs::write(manager.gadget_path.join("idVendor"), "0x1d6b\n").unwrap();
 +        fs::write(manager.gadget_path.join("idProduct"), "0x0104\n").unwrap();
 +        fs::write(manager.gadget_path.join("bcdDevice"), "0x0100\n").unwrap();
