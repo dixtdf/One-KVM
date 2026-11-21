@@ -1,5 +1,5 @@
 diff --git a/src/otg/manager.rs b/src/otg/manager.rs
-index 8bf4899..77dedbd 100644
+index 8bf4899..ed0e57b 100644
 --- a/src/otg/manager.rs
 +++ b/src/otg/manager.rs
 @@ -1,5 +1,5 @@
@@ -87,7 +87,7 @@ index 8bf4899..77dedbd 100644
          self.recreate_config_links()?;
  
          debug!("Binding gadget to UDC: {}", udc);
-@@ -377,6 +420,76 @@ impl OtgGadgetManager {
+@@ -377,6 +420,75 @@ impl OtgGadgetManager {
          &self.gadget_path
      }
  
@@ -154,17 +154,16 @@ index 8bf4899..77dedbd 100644
 +    /// Leave the ConfigFS tree in place and stop claiming ownership. The UDC
 +    /// binding and all function directories remain, so the USB host sees the
 +    /// same device after a service restart instead of a physical re-enumeration.
-+    pub fn relinquish(&mut self) -> Result<()> {
++    pub fn relinquish(&mut self) {
 +        self.bound_udc = None;
 +        self.created_by_us = false;
 +        info!("Released OTG gadget ownership without unbinding or deleting ConfigFS state");
-+        Ok(())
 +    }
 +
      fn recreate_config_links(&self) -> Result<()> {
          let functions_path = self.gadget_path.join("functions");
          if !functions_path.exists() || !self.config_path.exists() {
-@@ -413,6 +526,9 @@ impl Default for OtgGadgetManager {
+@@ -413,6 +525,9 @@ impl Default for OtgGadgetManager {
  
  impl Drop for OtgGadgetManager {
      fn drop(&mut self) {
@@ -174,7 +173,7 @@ index 8bf4899..77dedbd 100644
          if self.created_by_us {
              if let Err(e) = self.cleanup() {
                  error!("Failed to cleanup OTG gadget on drop: {}", e);
-@@ -534,6 +650,92 @@ mod tests {
+@@ -534,6 +649,92 @@ mod tests {
          assert!(!manager.gadget_exists());
      }
  
@@ -254,7 +253,7 @@ index 8bf4899..77dedbd 100644
 +
 +        manager.preserve_existing_udc("test-udc");
 +        manager.bind("test-udc").unwrap();
-+        manager.relinquish().unwrap();
++        manager.relinquish();
 +        manager.bind("test-udc").unwrap();
 +
 +        assert!(!manager.created_by_us);
@@ -268,7 +267,7 @@ index 8bf4899..77dedbd 100644
      fn test_function_selection_is_not_prevalidated() {
          let mut manager = OtgGadgetManager::with_config("test");
 diff --git a/src/otg/service.rs b/src/otg/service.rs
-index 91321ba..fabd2f7 100644
+index 91321ba..4e60d13 100644
 --- a/src/otg/service.rs
 +++ b/src/otg/service.rs
 @@ -466,11 +466,11 @@ impl OtgService {
@@ -284,16 +283,14 @@ index 91321ba..fabd2f7 100644
  
          let mut hid_paths = None;
          // Add UAC BEFORE HID so the isochronous endpoint gets a
-@@ -667,9 +667,9 @@ impl OtgService {
+@@ -667,9 +667,7 @@ impl OtgService {
  
          let mut manager = self.manager.lock().await;
          if let Some(m) = manager.as_mut() {
 -            m.cleanup().map_err(|e| {
 -                AppError::Internal(format!("Failed to clean up gadget during shutdown: {e}"))
 -            })?;
-+            if let Err(e) = m.relinquish() {
-+                warn!("Failed to release OTG gadget ownership during shutdown: {e}");
-+            }
++            m.relinquish();
          }
          manager.take();
  
